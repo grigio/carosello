@@ -134,7 +134,7 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
     toast_overlay.set_child(Some(&scrolled));
 
     let empty_label = gtk::Label::builder()
-        .label("No media files in current directory")
+        .label("Drag here an image or video")
         .css_classes(["empty-label"])
         .build();
     overlay.add_overlay(&empty_label);
@@ -649,6 +649,57 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
     }
 
     window.set_content(Some(&overlay));
+
+    // ── Drag and drop: load files dropped on the window ──
+    {
+        let drop_target = gtk::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::COPY);
+        let state = state.clone();
+        let picture = picture.clone();
+        let scrolled = scrolled.clone();
+        let window_clone = window.clone();
+        let empty_label = empty_label.clone();
+        drop_target.connect_drop(move |_, value, _, _| {
+            if let Ok(file_list) = value.get::<gdk::FileList>() {
+                let paths: Vec<PathBuf> = file_list
+                    .files()
+                    .iter()
+                    .filter_map(|f| f.path())
+                    .filter(|p| p.is_file())
+                    .collect();
+                if paths.is_empty() {
+                    return false;
+                }
+                // Load all media from the parent directory of the first dropped file
+                let read_dir = paths[0].parent().unwrap_or(Path::new("."));
+                let mut files: Vec<PathBuf> = std::fs::read_dir(read_dir)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.path())
+                    .filter(|p| p.is_file() && is_media(p))
+                    .collect();
+                if files.is_empty() {
+                    return false;
+                }
+                files.sort();
+                let start_index = files.iter().position(|f| f == &paths[0]).unwrap_or(0);
+                {
+                    let mut s = state.borrow_mut();
+                    s.files = files;
+                    s.index = start_index;
+                    s.zoom = 1.0;
+                }
+                scrolled.hadjustment().set_value(0.0);
+                scrolled.vadjustment().set_value(0.0);
+                scrolled.set_visible(true);
+                empty_label.set_visible(false);
+                show_file(&state, &picture, &scrolled, &window_clone);
+                return true;
+            }
+            false
+        });
+        overlay.add_controller(drop_target);
+    }
 
     // ── Actions ──
     let about_action = gio::SimpleAction::new("about", None);
