@@ -114,6 +114,8 @@ jobs:
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
           files: |
             artifacts/carosello-linux-x86_64/carosello
             artifacts/carosello-${{ github.ref_name }}-x86_64.flatpak/carosello.flatpak
