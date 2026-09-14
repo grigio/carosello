@@ -33,11 +33,11 @@ desktop_file = pkgdatadir / '@0@.desktop'.format(base_id)
 appstream_file = pkgdatadir / '@0@.metainfo.xml'.format(base_id)
 resources = gnome.compile_resources(
   '@0@-resources'.format(meson.project_name()),
-  '@0@.gresource.xml'.format(base_id),
+  'data/@0@.gresource.xml'.format(base_id),
   gresource_bundle: true,
   install: true,
   install_dir: pkgdatadir,
-  source_dir: meson.current_build_dir(),
+  source_dir: meson.project_source_root() / 'data',
   dependencies: [],
 )
 

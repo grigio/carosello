@@ -1,0 +1,5 @@
+[source.crates-io]
+replace-with = "local-registry"
+
+[source.local-registry]
+local = "cargo/registry/src"

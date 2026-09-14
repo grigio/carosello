@@ -28,7 +28,7 @@ fn main() -> glib::ExitCode {
         let start = args.get(1).map(PathBuf::from);
         let window = window::build(app, start.as_deref());
         window.present();
-        glib::ExitCode::SUCCESS
+        glib::ExitCode::SUCCESS.into()
     });
 
     app.run()

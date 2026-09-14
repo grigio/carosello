@@ -1,6 +1,6 @@
 app-id: com.github.carosello
 runtime: org.gnome.Platform
-runtime-version: '46'
+runtime-version: '48'
 sdk: org.gnome.Sdk
 sdk-extensions:
   - org.freedesktop.Sdk.Extension.rust-stable
@@ -27,7 +27,4 @@ modules:
     sources:
       - type: dir
         path: .
-      # Rust dependencies (generated with flatpak-cargo-generator.py)
-      # Run: flatpak-cargo-generator.py -o cargo-sources.json -r Cargo.lock
-      # Then uncomment and update:
-      # - cargo-sources.json
+      - cargo-sources.json
