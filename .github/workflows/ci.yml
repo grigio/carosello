@@ -41,6 +41,53 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Generate Cargo sources for Flatpak
+        run: |
+          python3 -c "
+          import tomllib, json
+
+          CRATES_IO = 'https://static.crates.io/crates'
+          VENDOR_DIR = 'cargo/vendored'
+
+          with open('Cargo.lock', 'rb') as f:
+              lock = tomllib.load(f)
+
+          sources = []
+
+          for pkg in lock.get('package', []):
+              name = pkg['name']
+              version = pkg['version']
+              source = pkg.get('source', '')
+              checksum = pkg.get('checksum', '')
+              if source.startswith('registry+') and checksum:
+                  crate_dir = f'{name}-{version}'
+                  sources.append({
+                      'type': 'archive',
+                      'archive-type': 'tar-gzip',
+                      'url': f'{CRATES_IO}/{name}/{crate_dir}.crate',
+                      'sha256': checksum,
+                      'dest': f'{VENDOR_DIR}/{crate_dir}',
+                  })
+                  sources.append({
+                      'type': 'inline',
+                      'contents': json.dumps({'package': checksum, 'files': {}}),
+                      'dest': f'{VENDOR_DIR}/{crate_dir}',
+                      'dest-filename': '.cargo-checksum.json',
+                  })
+
+          sources.append({
+              'type': 'shell',
+              'commands': [
+                  'mkdir -p .cargo',
+                  'cat > .cargo/config.toml <<\\'EOF\\'\n[source.crates-io]\nreplace-with = \"vendored-sources\"\n\n[source.vendored-sources]\ndirectory = \"/run/build/carosello/cargo/vendored\"\nEOF',
+              ],
+          })
+
+          with open('cargo-sources.json', 'w') as f:
+              json.dump(sources, f, indent=2)
+          print(f'Generated {len(sources)} source entries')
+          "
+
       - uses: flatpak/flatpak-github-actions/flatpak-builder@v6
         with:
           manifest-path: com.github.carosello.yml
