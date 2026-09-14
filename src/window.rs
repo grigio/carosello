@@ -1086,28 +1086,16 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
         let state = state.clone();
         let picture = picture.clone();
         let scrolled_w = scrolled.clone();
-        let window = window.clone();
-        glib::timeout_add_local(Duration::from_millis(50), move || {
-            let mut s = state.borrow_mut();
-            let w = scrolled_w.width();
-            let h = scrolled_w.height();
-            let (w, h) = if w <= 1 || h <= 1 {
-                (window.width(), window.height())
-            } else {
-                (w, h)
-            };
-            let changed = s.last_w != w || s.last_h != h;
-            if changed {
-                s.last_w = w;
-                s.last_h = h;
-            }
-            if !s.pending_update && !changed {
-                return glib::ControlFlow::Continue;
-            }
-            s.pending_update = false;
-            drop(s);
-            update_display(&state, &picture, &scrolled_w);
-            glib::ControlFlow::Continue
+        scrolled.connect_notify_local(Some("width"), move |_, _| {
+            notify_resize(&state, &picture, &scrolled_w);
+        });
+    }
+    {
+        let state = state.clone();
+        let picture = picture.clone();
+        let scrolled_w = scrolled.clone();
+        scrolled.connect_notify_local(Some("height"), move |_, _| {
+            notify_resize(&state, &picture, &scrolled_w);
         });
     }
 
@@ -1331,6 +1319,26 @@ fn show_image(
             }
         }
     }
+}
+
+fn notify_resize(state: &Rc<RefCell<AppState>>, picture: &gtk::Picture, scrolled: &gtk::ScrolledWindow) {
+    let mut s = state.borrow_mut();
+    let w = scrolled.width();
+    let h = scrolled.height();
+    if w <= 1 || h <= 1 {
+        return;
+    }
+    let changed = s.last_w != w || s.last_h != h;
+    if changed {
+        s.last_w = w;
+        s.last_h = h;
+    }
+    if !s.pending_update && !changed {
+        return;
+    }
+    s.pending_update = false;
+    drop(s);
+    update_display(state, picture, scrolled);
 }
 
 fn update_display(
