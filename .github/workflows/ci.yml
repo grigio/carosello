@@ -2,9 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, master]
   pull_request:
-    branches: [main, master]
 
 env:
   CARGO_TERM_COLOR: always
@@ -31,10 +29,16 @@ jobs:
       - name: Run tests
         run: cargo test
 
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: carosello-linux-x86_64
+          path: target/release/carosello
+
   flatpak:
     runs-on: ubuntu-latest
     container:
-      image: bilelmoussaoui/flatpak-github-actions:gnome-46
+      image: bilelmoussaoui/flatpak-github-actions:gnome-48
       options: --privileged
     steps:
       - uses: actions/checkout@v4
@@ -44,26 +48,30 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y rustc cargo
 
-      - name: Generate Cargo sources
+      - name: Generate Cargo sources for Flatpak
         run: |
           pip3 install toml
           python3 -c "
-          import toml, json, urllib.request, hashlib
-          cargo = toml.load('Cargo.lock')
+          import toml, json, hashlib
+
+          with open('Cargo.lock') as f:
+              lock = toml.load(f)
+
+          registry_hash = hashlib.md5(b'index.crates.io').hexdigest()[:16]
           sources = []
-          for pkg in cargo.get('package', []):
+          for pkg in lock.get('package', []):
               name = pkg['name']
               version = pkg['version']
               checksum = pkg.get('checksum', '')
               if checksum:
-                  url = f'https://crates.io/api/v1/crates/{name}/{version}/download'
                   sources.append({
                       'type': 'file',
-                      'url': url,
+                      'url': f'https://static.crates.io/crates/{name}/{name}-{version}.crate',
                       'sha256': checksum,
-                      'dest': f'cargo/registry/cache/index.crates.io-{hashlib.md5(b\"index.crates.io\").hexdigest()[:16]}/{name}-{version}.crate',
+                      'dest': f'cargo/registry/cache/index.crates.io-{registry_hash}',
                       'dest-filename': f'{name}-{version}.crate'
                   })
+
           with open('cargo-sources.json', 'w') as f:
               json.dump(sources, f, indent=2)
           "
@@ -72,3 +80,9 @@ jobs:
         with:
           manifest-path: com.github.carosello.yml
           bundle: carosello.flatpak
+
+      - name: Upload Flatpak bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: carosello-x86_64.flatpak
+          path: carosello.flatpak

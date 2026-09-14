@@ -2,3 +2,5 @@
 /builddir
 /subprojects
 .cargo/
+cargo/vendored
+cargo-sources.json
