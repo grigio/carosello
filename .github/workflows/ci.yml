@@ -92,9 +92,3 @@ jobs:
         with:
           manifest-path: com.github.carosello.yml
           bundle: carosello.flatpak
-
-      - name: Upload Flatpak bundle
-        uses: actions/upload-artifact@v4
-        with:
-          name: carosello-x86_64.flatpak
-          path: carosello.flatpak
