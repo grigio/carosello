@@ -17,6 +17,9 @@ finish-args:
   - --device=dri
   - --share=ipc
   - --talk-name=org.freedesktop.secrets
+  - --talk-name=org.freedesktop.portal.FileChooser
+  # Full filesystem access for image/video viewer
+  - --filesystem=home
   # Thumbnail access
   - --filesystem=xdg-run/gvfs
   - --filesystem=xdg-run/gvfsd

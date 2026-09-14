@@ -676,6 +676,10 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
                     .map(|e| e.path())
                     .filter(|p| p.is_file() && is_media(p))
                     .collect();
+                // If directory listing failed (e.g. sandbox), fall back to dropped files only
+                if files.is_empty() {
+                    files = paths.iter().filter(|p| is_media(p)).cloned().collect();
+                }
                 if files.is_empty() {
                     return false;
                 }
@@ -706,7 +710,7 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
         about_action.connect_activate(move |_, _| {
             let about = adw::AboutDialog::builder()
                 .application_name("Carosello")
-                .application_icon("image-x-generic")
+                .application_icon("com.github.carosello")
                 .developer_name("Carosello Contributors")
                 .version("0.1.0")
                 .copyright("© 2026 Carosello Contributors")
