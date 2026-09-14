@@ -1,0 +1,7 @@
+option(
+  'profile',
+  type: 'combo',
+  choices: ['default', 'dev'],
+  value: 'default',
+  description: 'Build profile',
+)

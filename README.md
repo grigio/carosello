@@ -1,6 +1,6 @@
 # Carosello
 
-A fast image and video viewer for Linux.
+A fast, minimalist image and video viewer for Linux.
 
 Built with **Rust** and **GTK4/libadwaita** for native Wayland/X11 support.
 
@@ -13,6 +13,7 @@ Built with **Rust** and **GTK4/libadwaita** for native Wayland/X11 support.
 - Video playback with controls (play/pause, seek, volume, mute)
 - Auto-hide controls for distraction-free viewing
 - EXIF orientation handling for rotated images
+- Drag and drop files or directories
 - Toast notifications for load errors
 - Fullscreen mode
 
@@ -23,14 +24,21 @@ Built with **Rust** and **GTK4/libadwaita** for native Wayland/X11 support.
 | Images | JPEG, PNG, WebP, GIF, BMP, TIFF |
 | Video | MP4, WebM, MKV |
 
-## Building
+## Installation
 
-### Dependencies
+### Flatpak (recommended)
 
-- Rust 1.75+
-- GTK 4.14+
-- libadwaita 1.6+
-- gettext (for i18n)
+Build and install the flatpak:
+
+```bash
+flatpak-builder --user --install --force-clean build-dir com.github.carosello.yml
+```
+
+Run directly:
+
+```bash
+flatpak run com.github.carosello
+```
 
 ### From source (Meson)
 
@@ -45,12 +53,6 @@ meson install -C builddir
 ```bash
 cargo build --release
 ./target/release/carosello
-```
-
-### Flatpak
-
-```bash
-flatpak-builder --user --install --force-clean build-dir com.github.carosello.yml
 ```
 
 ## Usage
@@ -117,6 +119,7 @@ carosello /path/to/image.jpg
 | 3-finger swipe | Navigate between files |
 | Drag (when zoomed) | Pan around the image/video |
 | Double-click | Toggle zoom (fit / 2.5x) |
+| Drag and drop | Open files or directories |
 
 ## Design Principles
 

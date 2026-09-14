@@ -1,10 +1,10 @@
 install_data(
-  meson.project_name() + '.desktop',
+  base_id + '.desktop',
   install_dir: datadir / 'applications',
 )
 
 install_data(
-  meson.project_name() + '.metainfo.xml',
+  base_id + '.metainfo.xml',
   install_dir: datadir / 'metainfo',
 )
 
