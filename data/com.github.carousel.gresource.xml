@@ -1,7 +1,0 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<gresources>
-  <gresource prefix="/com/github/carousel">
-    <file preprocess="xml-stripblanks" alias="icons/hicolor/scalable/apps/com.github.carousel.svg">icons/hicolor/scalable/apps/com.github.carousel.svg</file>
-    <file>style.css</file>
-  </gresource>
-</gresources>

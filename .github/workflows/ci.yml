@@ -70,5 +70,5 @@ jobs:
 
       - uses: flatpak/flatpak-github-actions/flatpak-builder@v6
         with:
-          manifest-path: com.github.carousel.yml
-          bundle: carousel.flatpak
+          manifest-path: com.github.carosello.yml
+          bundle: carosello.flatpak

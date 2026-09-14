@@ -99,10 +99,10 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
 
     let window = adw::ApplicationWindow::builder()
         .application(app)
-        .title("Carousel")
+        .title("Carosello")
         .default_width(900)
         .default_height(600)
-        .css_classes(["carousel-window"])
+        .css_classes(["carosello-window"])
         .build();
 
     let overlay = gtk::Overlay::new();
@@ -120,7 +120,7 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
         .has_frame(false)
         .propagate_natural_height(false)
         .propagate_natural_width(false)
-        .css_classes(["carousel-scrolled"])
+        .css_classes(["carosello-scrolled"])
         .build();
 
     let picture = gtk::Picture::builder()
@@ -656,15 +656,15 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
         let w = window.clone();
         about_action.connect_activate(move |_, _| {
             let about = adw::AboutDialog::builder()
-                .application_name("Carousel")
+                .application_name("Carosello")
                 .application_icon("image-x-generic")
-                .developer_name("Carousel Contributors")
+                .developer_name("Carosello Contributors")
                 .version("0.1.0")
-                .copyright("© 2026 Carousel Contributors")
+                .copyright("© 2026 Carosello Contributors")
                 .license_type(gtk::License::Gpl30)
-                .website("https://github.com/aspect-build/carousel")
-                .issue_url("https://github.com/aspect-build/carousel/issues")
-                .developers(vec!["Carousel Contributors"])
+                .website("https://github.com/grigio/carosello")
+                .issue_url("https://github.com/grigio/carosello/issues")
+                .developers(vec!["Carosello Contributors"])
                 .build();
             about.present(Some(&w));
         });
@@ -1436,7 +1436,7 @@ fn show_video(
     }
 
     // TEMP-DIAG hook (removed before release): programmatic zoom.
-    if std::env::var("CAROUSEL_DEBUG_ZOOM").is_ok() {
+    if std::env::var("CAROSELLO_DEBUG_ZOOM").is_ok() {
         let state = state.clone();
         let picture = picture.clone();
         let scrolled = scrolled.clone();

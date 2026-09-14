@@ -1,4 +1,4 @@
-# Carousel
+# Carosello
 
 A fast image and video viewer for Linux.
 
@@ -44,26 +44,26 @@ meson install -C builddir
 
 ```bash
 cargo build --release
-./target/release/carousel
+./target/release/carosello
 ```
 
 ### Flatpak
 
 ```bash
-flatpak-builder --user --install --force-clean build-dir com.github.carousel.yml
+flatpak-builder --user --install --force-clean build-dir com.github.carosello.yml
 ```
 
 ## Usage
 
 ```bash
 # View media in current directory
-carousel
+carosello
 
 # View media in a specific directory
-carousel /path/to/directory
+carosello /path/to/directory
 
 # View a specific file (shows siblings)
-carousel /path/to/image.jpg
+carosello /path/to/image.jpg
 ```
 
 ## Keyboard Shortcuts

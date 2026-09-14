@@ -1,10 +1,10 @@
 [package]
-name = "carousel"
+name = "carosello"
 version = "0.1.0"
 edition = "2021"
 description = "A fast, minimalist image and video viewer for Linux"
 license = "GPL-3.0-or-later"
-repository = "https://github.com/giancarlo/carousel"
+repository = "https://github.com/grigio/carosello"
 readme = "README.md"
 keywords = ["image", "video", "viewer", "gtk", "gnome"]
 categories = ["gui", "multimedia"]

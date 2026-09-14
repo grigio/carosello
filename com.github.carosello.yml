@@ -1,15 +1,15 @@
-app-id: com.github.carousel
+app-id: com.github.carosello
 runtime: org.gnome.Platform
 runtime-version: '46'
 sdk: org.gnome.Sdk
 sdk-extensions:
   - org.freedesktop.Sdk.Extension.rust-stable
-command: carousel
+command: carosello
 
 build-options:
   append-path: /usr/lib/sdk/rust-stable/bin
   env:
-    CARGO_HOME: /run/build-carousel/cargo
+    CARGO_HOME: /run/build-carosello/cargo
 
 finish-args:
   - --socket=fallback-x11
@@ -22,7 +22,7 @@ finish-args:
   - --filesystem=xdg-run/gvfsd
 
 modules:
-  - name: carousel
+  - name: carosello
     buildsystem: meson
     sources:
       - type: dir

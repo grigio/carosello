@@ -31,7 +31,7 @@ mod zoom_paintable {
 
     #[glib::object_subclass]
     impl ObjectSubclass for ZoomPaintableImp {
-        const NAME: &'static str = "CarouselZoomPaintable";
+        const NAME: &'static str = "CaroselloZoomPaintable";
         type Type = ZoomPaintable;
         type Interfaces = (gdk::Paintable,);
     }

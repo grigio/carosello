@@ -2,7 +2,7 @@ use gtk::gdk;
 
 pub fn load_css() {
     let provider = gtk::CssProvider::new();
-    provider.load_from_resource("/com/github/carousel/style.css");
+    provider.load_from_resource("/com/github/carosello/style.css");
 
     gtk::style_context_add_provider_for_display(
         &gdk::Display::default().expect("Could not get default display"),

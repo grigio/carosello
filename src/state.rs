@@ -29,8 +29,8 @@ pub fn format_time(micros: i64) -> String {
 }
 
 pub fn debug_log(msg: &str) {
-    if std::env::var("CAROUSEL_DEBUG").is_ok() {
-        eprintln!("[carousel-debug] {msg}");
+    if std::env::var("CAROSELLO_DEBUG").is_ok() {
+        eprintln!("[carosello-debug] {msg}");
     }
 }
 
