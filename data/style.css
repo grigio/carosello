@@ -1,0 +1,98 @@
+.carousel-window {
+    background-color: black;
+}
+.carousel-scrolled {
+    background-color: black;
+}
+.carousel-scrolled viewport {
+    background-color: black;
+}
+.fade-controls {
+    transition: opacity 350ms ease-in-out;
+}
+.controls-bg {
+    background-color: alpha(rgba(0,0,0,0.65), 0.9);
+    border-radius: 18px;
+    padding: 2px;
+}
+.controls-bg-top {
+    background-color: alpha(rgba(0,0,0,0.65), 0.9);
+    padding: 0;
+}
+.controls-bg-bottom {
+    background-color: alpha(rgba(0,0,0,0.65), 0.9);
+    border-radius: 18px;
+    padding: 8px 12px;
+}
+.empty-label {
+    color: alpha(white, 0.6);
+    font-size: 16px;
+}
+.ctrl-btn {
+    background-color: alpha(white, 0.15);
+    border-radius: 999px;
+    padding: 4px;
+    min-width: 30px;
+    min-height: 30px;
+    color: white;
+}
+.ctrl-btn:hover {
+    background-color: alpha(white, 0.3);
+}
+.ctrl-btn:active {
+    background-color: alpha(white, 0.4);
+}
+.seek-bar trough {
+    background-color: alpha(white, 0.2);
+    border-radius: 4px;
+    min-height: 4px;
+    padding: 0;
+    transition: min-height 200ms ease-in-out;
+}
+.seek-bar:hover trough {
+    min-height: 6px;
+}
+.seek-bar trough highlight {
+    background-color: alpha(white, 0.7);
+    border-radius: 4px;
+    min-height: 4px;
+}
+.seek-bar:hover trough highlight {
+    min-height: 6px;
+}
+.seek-bar trough slider {
+    background-color: white;
+    border-radius: 999px;
+    min-width: 14px;
+    min-height: 14px;
+    margin: -2px;
+    opacity: 0;
+    transition: opacity 200ms ease-in-out;
+}
+.seek-bar:hover trough slider {
+    opacity: 1;
+}
+.time-label {
+    color: alpha(white, 0.85);
+    font-size: 12px;
+    font-weight: bold;
+    min-width: 48px;
+}
+.volume-bar trough {
+    background-color: alpha(white, 0.2);
+    border-radius: 4px;
+    min-height: 4px;
+    padding: 0;
+}
+.volume-bar trough highlight {
+    background-color: alpha(white, 0.7);
+    border-radius: 4px;
+    min-height: 4px;
+}
+.volume-bar trough slider {
+    background-color: white;
+    border-radius: 999px;
+    min-width: 12px;
+    min-height: 12px;
+    margin: -2px;
+}

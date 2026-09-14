@@ -1,0 +1,10 @@
+[package]
+name = "carousel"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+gtk = { package = "gtk4", version = "0.11", features = ["gnome_45"] }
+gdk-pixbuf = { package = "gdk-pixbuf", version = "0.22" }
+libadwaita = { version = "0.9", features = ["v1_6"] }
+kamadak-exif = "0.6"

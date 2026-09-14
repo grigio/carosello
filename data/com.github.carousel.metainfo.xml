@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.github.carousel</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <name>Carousel</name>
+  <summary>A fast, minimalist image and video viewer for Linux</summary>
+  <description>
+    <p>
+      Carousel is a fast, minimalist image and video viewer for Linux.
+      It opens images and videos from a directory, lets you navigate
+      between files with keyboard shortcuts or gestures, and displays
+      them with zoom and pan capabilities.
+    </p>
+    <p>Features:</p>
+    <ul>
+      <li>Keyboard-first navigation</li>
+      <li>Pinch-to-zoom and scroll wheel zoom</li>
+      <li>EXIF orientation support</li>
+      <li>Video playback with seek controls</li>
+      <li>Auto-hide overlay controls</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">com.github.carousel.desktop</launchable>
+  <url type="homepage">https://github.com/aspect-build/carousel</url>
+  <url type="bugtracker">https://github.com/aspect-build/carousel/issues</url>
+  <developer id="com.github.carousel">
+    <name>Carousel Contributors</name>
+  </developer>
+  <content_rating type="oars-1.1" />
+  <releases>
+    <release version="0.1.0" date="2026-09-14">
+      <description>
+        <p>Initial release.</p>
+      </description>
+    </release>
+  </releases>
+  <supports>
+    <control>pointing</control>
+    <control>keyboard</control>
+  </supports>
+  <requires>
+    <display_length compare="ge">360</display_length>
+  </requires>
+</component>
