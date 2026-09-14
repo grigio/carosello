@@ -1,1 +1,4 @@
 /target
+/builddir
+/subprojects
+.cargo/

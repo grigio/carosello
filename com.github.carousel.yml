@@ -1,0 +1,33 @@
+app-id: com.github.carousel
+runtime: org.gnome.Platform
+runtime-version: '46'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: carousel
+
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_HOME: /run/build-carousel/cargo
+
+finish-args:
+  - --socket=fallback-x11
+  - --socket=wayland
+  - --device=dri
+  - --share=ipc
+  - --talk-name=org.freedesktop.secrets
+  # Thumbnail access
+  - --filesystem=xdg-run/gvfs
+  - --filesystem=xdg-run/gvfsd
+
+modules:
+  - name: carousel
+    buildsystem: meson
+    sources:
+      - type: dir
+        path: .
+      # Rust dependencies (generated with flatpak-cargo-generator.py)
+      # Run: flatpak-cargo-generator.py -o cargo-sources.json -r Cargo.lock
+      # Then uncomment and update:
+      # - cargo-sources.json

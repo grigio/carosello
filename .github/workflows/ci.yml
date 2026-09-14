@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/nickvision/ci:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-4-dev \
+            libadwaita-1-dev \
+            gettext
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Run tests
+        run: cargo test
+
+  flatpak:
+    runs-on: ubuntu-latest
+    container:
+      image: bilelmoussaoui/flatpak-github-actions:gnome-46
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rustc cargo
+
+      - name: Generate Cargo sources
+        run: |
+          pip3 install toml
+          python3 -c "
+          import toml, json, urllib.request, hashlib
+          cargo = toml.load('Cargo.lock')
+          sources = []
+          for pkg in cargo.get('package', []):
+              name = pkg['name']
+              version = pkg['version']
+              checksum = pkg.get('checksum', '')
+              if checksum:
+                  url = f'https://crates.io/api/v1/crates/{name}/{version}/download'
+                  sources.append({
+                      'type': 'file',
+                      'url': url,
+                      'sha256': checksum,
+                      'dest': f'cargo/registry/cache/index.crates.io-{hashlib.md5(b\"index.crates.io\").hexdigest()[:16]}/{name}-{version}.crate',
+                      'dest-filename': f'{name}-{version}.crate'
+                  })
+          with open('cargo-sources.json', 'w') as f:
+              json.dump(sources, f, indent=2)
+          "
+
+      - uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          manifest-path: com.github.carousel.yml
+          bundle: carousel.flatpak

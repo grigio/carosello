@@ -22,8 +22,8 @@
     </ul>
   </description>
   <launchable type="desktop-id">com.github.carousel.desktop</launchable>
-  <url type="homepage">https://github.com/aspect-build/carousel</url>
-  <url type="bugtracker">https://github.com/aspect-build/carousel/issues</url>
+  <url type="homepage">https://github.com/giancarlo/carousel</url>
+  <url type="bugtracker">https://github.com/giancarlo/carousel/issues</url>
   <developer id="com.github.carousel">
     <name>Carousel Contributors</name>
   </developer>

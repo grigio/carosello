@@ -701,7 +701,7 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
         let picture = picture.clone();
         let scrolled = scrolled.clone();
         let window = window.clone();
-        key_ctrl.connect_key_pressed(move |_, key, _, _| match key {
+        key_ctrl.connect_key_pressed(move |_, key, _, modifier| match key {
             // Navigation
             gdk::Key::Left => {
                 nav(&state, &picture, &scrolled, &window, -1);
@@ -737,6 +737,25 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
                 } else {
                     glib::Propagation::Proceed
                 }
+            }
+            // Quit: Ctrl+Q
+            gdk::Key::q if modifier.contains(gtk::gdk::ModifierType::CONTROL_MASK) => {
+                let app = window.application().expect("Window has no application");
+                app.quit();
+                glib::Propagation::Stop
+            }
+            // Close: Ctrl+W
+            gdk::Key::w if modifier.contains(gtk::gdk::ModifierType::CONTROL_MASK) => {
+                window.close();
+                glib::Propagation::Stop
+            }
+            // Help: F1
+            gdk::Key::F1 => {
+                // Trigger the about action
+                if let Some(action) = window.lookup_action("about") {
+                    action.activate(None);
+                }
+                glib::Propagation::Stop
             }
             // Mute toggle
             gdk::Key::space => {

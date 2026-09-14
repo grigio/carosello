@@ -23,6 +23,36 @@ Built with **Rust** and **GTK4/libadwaita** for native Wayland/X11 support.
 | Images | JPEG, PNG, WebP, GIF, BMP, TIFF |
 | Video | MP4, WebM, MKV |
 
+## Building
+
+### Dependencies
+
+- Rust 1.75+
+- GTK 4.14+
+- libadwaita 1.6+
+- gettext (for i18n)
+
+### From source (Meson)
+
+```bash
+meson setup builddir
+meson compile -C builddir
+meson install -C builddir
+```
+
+### From source (Cargo)
+
+```bash
+cargo build --release
+./target/release/carousel
+```
+
+### Flatpak
+
+```bash
+flatpak-builder --user --install --force-clean build-dir com.github.carousel.yml
+```
+
 ## Usage
 
 ```bash
@@ -61,6 +91,14 @@ carousel /path/to/image.jpg
 |-----|--------|
 | `F11` / `F` | Toggle fullscreen |
 
+### Application
+
+| Key | Action |
+|-----|--------|
+| `Ctrl+Q` | Quit |
+| `Ctrl+W` | Close window |
+| `F1` | About |
+
 ### Video Controls
 
 | Key | Action |
@@ -92,3 +130,7 @@ carousel /path/to/image.jpg
 - **UI Toolkit:** GTK4 + libadwaita
 - **Image Loading:** gdk-pixbuf
 - **EXIF Parsing:** kamadak-exif
+
+## License
+
+GPL-3.0-or-later
