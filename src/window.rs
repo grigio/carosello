@@ -1455,9 +1455,19 @@ fn show_video(
     media.set_loop(true);
     media.set_muted(true);
     media.set_volume(1.0);
-    media.play();
 
     state.borrow_mut().media_file = Some(media.clone());
+
+    // Delay play() until the GStreamer pipeline is prepared
+    {
+        let media_clone = media.clone();
+        media.connect_prepared_notify(move |_| {
+            media_clone.play();
+        });
+        if media.is_prepared() {
+            media.play();
+        }
+    }
 
     let zp = state.borrow().video_view.clone();
     if let Some(ref zp) = zp {
