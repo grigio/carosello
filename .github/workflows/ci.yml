@@ -41,39 +41,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y rustc cargo
-
-      - name: Generate Cargo sources for Flatpak
-        run: |
-          pip3 install toml
-          python3 -c "
-          import toml, json, hashlib
-
-          with open('Cargo.lock') as f:
-              lock = toml.load(f)
-
-          registry_hash = hashlib.md5(b'index.crates.io').hexdigest()[:16]
-          sources = []
-          for pkg in lock.get('package', []):
-              name = pkg['name']
-              version = pkg['version']
-              checksum = pkg.get('checksum', '')
-              if checksum:
-                  sources.append({
-                      'type': 'file',
-                      'url': f'https://static.crates.io/crates/{name}/{name}-{version}.crate',
-                      'sha256': checksum,
-                      'dest': f'cargo/registry/cache/index.crates.io-{registry_hash}',
-                      'dest-filename': f'{name}-{version}.crate'
-                  })
-
-          with open('cargo-sources.json', 'w') as f:
-              json.dump(sources, f, indent=2)
-          "
-
       - uses: flatpak/flatpak-github-actions/flatpak-builder@v6
         with:
           manifest-path: com.github.carosello.yml
