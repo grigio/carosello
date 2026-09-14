@@ -4,6 +4,8 @@ A fast, minimalist image and video viewer for Linux.
 
 Built with **Rust** and **GTK4/libadwaita** for native Wayland/X11 support.
 
+![Carosello Screenshot](carosello.png)
+
 ## Features
 
 - Opens images and videos from a directory
