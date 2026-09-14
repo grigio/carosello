@@ -34,6 +34,14 @@ Build and install the flatpak:
 flatpak-builder --user --install --force-clean build-dir com.github.carosello.yml
 ```
 
+### From GitHub artifact
+
+Download the latest `.flatpak` file from [GitHub Releases](https://github.com/grigio/carosello/releases) and install it:
+
+```bash
+flatpak install --user carosello.flatpak
+```
+
 Run directly:
 
 ```bash
