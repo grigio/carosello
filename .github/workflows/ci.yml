@@ -115,4 +115,4 @@ jobs:
         with:
           files: |
             artifacts/carosello-linux-x86_64/carosello
-            artifacts/carosello.flatpak/carosello.flatpak
+            artifacts/flatpak/carosello.flatpak
