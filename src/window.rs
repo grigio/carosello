@@ -507,12 +507,10 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
                     s.mouse_y = y;
                 }
                 let win_h = window_ref.height() as f64;
-                let win_w = window_ref.width() as f64;
                 let at_top = y < win_h * EDGE_THRESHOLD;
                 let at_bottom = y > win_h * (1.0 - EDGE_THRESHOLD);
-                let at_edge_x = x < 24.0 || x > win_w - 24.0;
-                let in_top_zone = at_top || at_edge_x;
-                let in_bottom_zone = at_bottom || at_edge_x;
+                let in_top_zone = at_top;
+                let in_bottom_zone = at_bottom;
                 let in_any_zone = in_top_zone || in_bottom_zone;
                 if in_any_zone {
                     if let Some(id) = hide_id.take() {
