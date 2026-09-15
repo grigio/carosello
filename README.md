@@ -33,7 +33,7 @@ Built with **Rust** and **GTK4/libadwaita** for native Wayland/X11 support.
 Build and install the flatpak:
 
 ```bash
-flatpak-builder --user --install --force-clean build-dir com.github.carosello.yml
+flatpak-builder --user --install --force-clean build-dir io.github.grigio.carosello.yml
 ```
 
 ### From GitHub artifact
@@ -47,7 +47,7 @@ flatpak install --user carosello.flatpak
 Run directly:
 
 ```bash
-flatpak run com.github.carosello
+flatpak run io.github.grigio.carosello
 ```
 
 ### From source (Meson)

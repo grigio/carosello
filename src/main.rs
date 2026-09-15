@@ -10,7 +10,7 @@ use gtk::prelude::*;
 use gtk::{self, glib};
 use libadwaita as adw;
 
-const APP_ID: &str = "com.github.carosello";
+const APP_ID: &str = "io.github.grigio.carosello";
 
 fn main() -> glib::ExitCode {
     let app = adw::Application::builder()

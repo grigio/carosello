@@ -1,4 +1,4 @@
-app-id: com.github.carosello
+app-id: io.github.grigio.carosello
 runtime: org.gnome.Platform
 runtime-version: '48'
 sdk: org.gnome.Sdk
@@ -17,7 +17,6 @@ finish-args:
   - --device=dri
   - --share=ipc
   - --talk-name=org.freedesktop.secrets
-  - --talk-name=org.freedesktop.portal.FileChooser
   # Full filesystem access for image/video viewer
   - --filesystem=home
   # Thumbnail access

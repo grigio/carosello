@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
-  <id>com.github.carosello</id>
+  <id>io.github.grigio.carosello</id>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>GPL-3.0-or-later</project_license>
   <name>Carosello</name>
@@ -21,13 +21,19 @@
       <li>Auto-hide overlay controls</li>
     </ul>
   </description>
-  <launchable type="desktop-id">com.github.carosello.desktop</launchable>
+  <launchable type="desktop-id">io.github.grigio.carosello.desktop</launchable>
   <url type="homepage">https://github.com/grigio/carosello</url>
   <url type="bugtracker">https://github.com/grigio/carosello/issues</url>
-  <developer id="com.github.carosello">
+  <developer id="io.github.grigio.carosello">
     <name>Carosello Contributors</name>
   </developer>
   <content_rating type="oars-1.1" />
+  <screenshots>
+    <screenshot type="default">
+      <image>https://github.com/grigio/carosello/raw/master/carosello.png</image>
+      <caption>Carosello viewing images with navigation controls</caption>
+    </screenshot>
+  </screenshots>
   <releases>
     <release version="0.1.0" date="2026-09-14">
       <description>

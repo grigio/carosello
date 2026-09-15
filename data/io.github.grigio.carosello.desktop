@@ -2,7 +2,7 @@
 Name=Carosello
 Comment=A fast, minimalist image and video viewer for Linux
 Exec=carosello %u
-Icon=com.github.carosello
+Icon=io.github.grigio.carosello
 Terminal=false
 Type=Application
 Categories=Graphics;Viewer;

@@ -710,7 +710,7 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
         about_action.connect_activate(move |_, _| {
             let about = adw::AboutDialog::builder()
                 .application_name("Carosello")
-                .application_icon("com.github.carosello")
+                .application_icon("io.github.grigio.carosello")
                 .developer_name("Carosello Contributors")
                 .version("0.1.0")
                 .copyright("© 2026 Carosello Contributors")
