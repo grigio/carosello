@@ -15,7 +15,7 @@ build-options:
 finish-args:
   - --share=ipc
   - --socket=wayland
-  - --fallback-x11
+  - --socket=fallback-x11
   - --device=dri
   - --talk-name=org.freedesktop.secrets
   # Use portals for file access (xdg-pictures/videos) + fallback for drag-and-drop

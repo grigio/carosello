@@ -35,6 +35,11 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="1.0.4" date="2026-09-18">
+      <description>
+        <p>Fix CI: correct libadwaita/gtk requirements and flatpak finish-args.</p>
+      </description>
+    </release>
     <release version="1.0.3" date="2026-09-18">
       <description>
         <p>Fit media to window and handle resize; HIG improvements.</p>
