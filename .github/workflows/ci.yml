@@ -24,6 +24,12 @@ jobs:
             libadwaita-1-dev \
             gettext
 
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy -- -D warnings
+
       - name: Build
         run: cargo build --release
 

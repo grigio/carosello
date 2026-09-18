@@ -29,7 +29,10 @@ pub fn format_time(micros: i64) -> String {
 }
 
 pub fn debug_log(msg: &str) {
-    if std::env::var("CAROSELLO_DEBUG").is_ok() {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    let enabled = ENABLED.get_or_init(|| std::env::var("CAROSELLO_DEBUG").is_ok());
+    if *enabled {
         eprintln!("[carosello-debug] {msg}");
     }
 }

@@ -1,8 +1,10 @@
 .carosello-window {
     background-color: black;
+    border-radius: 12px;
 }
 .carosello-scrolled {
     background-color: black;
+    border-radius: 12px;
 }
 .carosello-scrolled viewport {
     background-color: black;
@@ -74,8 +76,8 @@
 }
 .time-label {
     color: alpha(white, 0.85);
-    font-size: 12px;
-    font-weight: bold;
+    font-variant-numeric: tabular-nums;
+    font-family: monospace;
     min-width: 48px;
 }
 .volume-bar trough {

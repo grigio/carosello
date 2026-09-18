@@ -5,7 +5,7 @@ use gtk::gio;
 
 pub fn load_css() {
     let provider = gtk::CssProvider::new();
-    let resource_path = "/com/github/carosello/style.css";
+    let resource_path = "/io/github/grigio/carosello/style.css";
     let mut loaded = false;
 
     // 1. Try GResource from installed path (flatpak/meson)
@@ -34,6 +34,7 @@ pub fn load_css() {
         provider.load_from_resource(resource_path);
     }
 
+    #[allow(deprecated)]
     gtk::style_context_add_provider_for_display(
         &gdk::Display::default().expect("Could not get default display"),
         &provider,

@@ -1,6 +1,7 @@
 app-id: io.github.grigio.carosello
 runtime: org.gnome.Platform
 runtime-version: '48'
+branch: stable
 sdk: org.gnome.Sdk
 sdk-extensions:
   - org.freedesktop.Sdk.Extension.rust-stable
@@ -12,13 +13,15 @@ build-options:
     CARGO_HOME: /run/build-carosello/cargo
 
 finish-args:
-  - --socket=fallback-x11
-  - --socket=wayland
-  - --device=dri
   - --share=ipc
+  - --socket=wayland
+  - --fallback-x11
+  - --device=dri
   - --talk-name=org.freedesktop.secrets
-  # Full filesystem access for image/video viewer
-  - --filesystem=home
+  # Use portals for file access (xdg-pictures/videos) + fallback for drag-and-drop
+  - --filesystem=xdg-pictures:ro
+  - --filesystem=xdg-videos:ro
+  - --filesystem=xdg-download:ro
   # Thumbnail access
   - --filesystem=xdg-run/gvfs
   - --filesystem=xdg-run/gvfsd

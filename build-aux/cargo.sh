@@ -32,8 +32,10 @@ else
   fi
 fi
 
-# Strip the binary in release builds
-strip "$BINARY" 2>/dev/null || true
+# Strip the binary in release builds (preserve debuginfo for Flatpak/Flathub unless explicitly requested)
+if [ "${CARGO_STRIP:-0}" = "1" ]; then
+  strip "$BINARY" 2>/dev/null || true
+fi
 
 # Copy the binary to the output location
 cp "$BINARY" "$3" || exit 1

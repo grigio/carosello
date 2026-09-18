@@ -41,6 +41,8 @@ struct AppState {
     bottom_bar: Option<gtk::Box>,
     volume_scale: Option<gtk::Scale>,
     toast_overlay: Option<adw::ToastOverlay>,
+    window_title: Option<adw::WindowTitle>,
+    empty_status: Option<adw::StatusPage>,
 }
 
 pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWindow {
@@ -73,6 +75,8 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
         bottom_bar: None,
         volume_scale: None,
         toast_overlay: None,
+        window_title: None,
+        empty_status: None,
     }));
 
     let mut start_index: usize = 0;
@@ -122,6 +126,8 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
         .propagate_natural_width(false)
         .css_classes(["carosello-scrolled"])
         .build();
+    scrolled.update_property(&[gtk::accessible::Property::Label("Image and video view")]);
+    scrolled.set_accessible_role(gtk::AccessibleRole::Group);
 
     let picture = gtk::Picture::builder()
         .halign(gtk::Align::Center)
@@ -133,16 +139,34 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
     scrolled.set_child(Some(&picture));
     toast_overlay.set_child(Some(&scrolled));
 
-    let empty_label = gtk::Label::builder()
-        .label("Drag here an image or video")
-        .css_classes(["empty-label"])
+    let empty_status = adw::StatusPage::builder()
+        .icon_name("system-file-manager-symbolic")
+        .title("No Images Found")
+        .description("Drag an image or video here or open a file")
         .build();
-    overlay.add_overlay(&empty_label);
+    empty_status.add_css_class("compact");
+    let open_btn_status = gtk::Button::builder()
+        .label("Open…")
+        .halign(gtk::Align::Center)
+        .css_classes(["pill", "suggested-action"])
+        .build();
+    empty_status.set_child(Some(&open_btn_status));
+    {
+        let w = window.clone();
+        open_btn_status.connect_clicked(move |_| {
+            gio::prelude::ActionGroupExt::activate_action(&w, "open", None);
+        });
+    }
+    overlay.add_overlay(&empty_status);
 
-    // ── Top: AdwHeaderBar (GNOME HIG standard) ──
+    // ── Top: AdwHeaderBar with AdwWindowTitle (GNOME HIG) ──
+    let window_title = adw::WindowTitle::builder().title("Carosello").build();
     let header_bar = adw::HeaderBar::builder()
-        .css_classes(["flat", "titlebar", "controls-bg-top"])
+        .title_widget(&window_title)
+        .css_classes(["flat", "titlebar", "controls-bg-top", "osd"])
         .build();
+    state.borrow_mut().window_title = Some(window_title.clone());
+    state.borrow_mut().empty_status = Some(empty_status.clone());
 
     // ── Top-left: fullscreen button ──
     let fullscreen_btn = gtk::Button::builder()
@@ -150,6 +174,8 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
         .tooltip_text("Toggle Fullscreen (F11)")
         .css_classes(["flat"])
         .build();
+    fullscreen_btn.update_property(&[gtk::accessible::Property::Label("Toggle Fullscreen")]);
+    fullscreen_btn.set_accessible_role(gtk::AccessibleRole::Button);
     {
         let w = window.clone();
         fullscreen_btn.connect_clicked(move |_| w.set_fullscreened(!w.is_fullscreen()));
@@ -162,6 +188,8 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
         .tooltip_text("Zoom Out (Ctrl+-)")
         .css_classes(["flat"])
         .build();
+    zoom_out_btn.update_property(&[gtk::accessible::Property::Label("Zoom Out")]);
+    zoom_out_btn.set_accessible_role(gtk::AccessibleRole::Button);
     {
         let state = state.clone();
         let picture = picture.clone();
@@ -177,6 +205,8 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
         .tooltip_text("Reset Zoom (Ctrl+0)")
         .css_classes(["flat"])
         .build();
+    zoom_reset_btn.update_property(&[gtk::accessible::Property::Label("Reset Zoom")]);
+    zoom_reset_btn.set_accessible_role(gtk::AccessibleRole::Button);
     {
         let state = state.clone();
         let picture = picture.clone();
@@ -192,6 +222,8 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
         .tooltip_text("Zoom In (Ctrl++)")
         .css_classes(["flat"])
         .build();
+    zoom_in_btn.update_property(&[gtk::accessible::Property::Label("Zoom In")]);
+    zoom_in_btn.set_accessible_role(gtk::AccessibleRole::Button);
     {
         let state = state.clone();
         let picture = picture.clone();
@@ -203,6 +235,7 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
     header_bar.pack_end(&zoom_in_btn);
 
     let section = gio::Menu::new();
+    section.append(Some("Open…"), Some("win.open"));
     section.append(Some("About"), Some("win.about"));
     let quit_section = gio::Menu::new();
     quit_section.append(Some("Quit"), Some("app.quit"));
@@ -218,7 +251,7 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
         .build();
     header_bar.pack_end(&menu_btn);
 
-    // Wrap the header bar in a WindowHandle for drag support
+    // Wrap the header bar in a WindowHandle for drag support (overlay, transparent, no push)
     let top_handle = gtk::WindowHandle::new();
     top_handle.set_child(Some(&header_bar));
     top_handle.set_opacity(0.0);
@@ -255,9 +288,11 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
     let position_label = gtk::Label::builder()
         .label("0:00")
         .halign(gtk::Align::Start)
-        .css_classes(["time-label"])
+        .css_classes(["time-label", "caption", "monospace", "numeric"])
         .build();
     position_label.set_xalign(0.0);
+    // a11y: time labels should be numeric and respect text scaling via caption
+    position_label.update_property(&[gtk::accessible::Property::Label("Played time")]);
     seek_row.append(&position_label);
 
     let seek_scale = gtk::Scale::builder()
@@ -266,6 +301,8 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
         .css_classes(["seek-bar"])
         .value_pos(gtk::PositionType::Right)
         .build();
+    seek_scale.update_property(&[gtk::accessible::Property::Label("Seek position")]);
+    seek_scale.set_accessible_role(gtk::AccessibleRole::Slider);
     seek_scale.set_range(0.0, 500.0);
     seek_scale.set_increments(1.0, 10.0);
     {
@@ -325,8 +362,8 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
         let state = state.clone();
         click_gesture.connect_released(move |_, _, _, _| {
             let mut s = state.borrow_mut();
-    s.seeking = false;
-    s.updating_seek_bar = false;
+            s.seeking = false;
+            s.updating_seek_bar = false;
         });
     }
     seek_scale.add_controller(click_gesture);
@@ -340,18 +377,16 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
         let window = window.clone();
         let seek_key_ctrl = gtk::EventControllerKey::new();
         seek_key_ctrl.set_propagation_phase(gtk::PropagationPhase::Capture);
-        seek_key_ctrl.connect_key_pressed(move |_, key, _, _| {
-            match key {
-                gdk::Key::Left => {
-                    nav(&state, &picture, &scrolled, &window, -1);
-                    glib::Propagation::Stop
-                }
-                gdk::Key::Right => {
-                    nav(&state, &picture, &scrolled, &window, 1);
-                    glib::Propagation::Stop
-                }
-                _ => glib::Propagation::Proceed,
+        seek_key_ctrl.connect_key_pressed(move |_, key, _, _| match key {
+            gdk::Key::Left => {
+                nav(&state, &picture, &scrolled, &window, -1);
+                glib::Propagation::Stop
             }
+            gdk::Key::Right => {
+                nav(&state, &picture, &scrolled, &window, 1);
+                glib::Propagation::Stop
+            }
+            _ => glib::Propagation::Proceed,
         });
         seek_scale.add_controller(seek_key_ctrl);
     }
@@ -361,9 +396,10 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
     let duration_label = gtk::Label::builder()
         .label("0:00")
         .halign(gtk::Align::End)
-        .css_classes(["time-label"])
+        .css_classes(["time-label", "caption", "monospace", "numeric"])
         .build();
     duration_label.set_xalign(1.0);
+    duration_label.update_property(&[gtk::accessible::Property::Label("Total duration")]);
     seek_row.append(&duration_label);
 
     // Button row: play/pause + volume + mute (centered)
@@ -377,6 +413,8 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
         .tooltip_text("Play/Pause (Space)")
         .css_classes(["ctrl-btn"])
         .build();
+    play_pause_btn.update_property(&[gtk::accessible::Property::Label("Play/Pause")]);
+    play_pause_btn.set_accessible_role(gtk::AccessibleRole::Button);
     {
         let state = state.clone();
         play_pause_btn.connect_clicked(move |btn| {
@@ -395,7 +433,7 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
         });
     }
 
-    // Volume slider
+    // Volume slider (HIG: slider with value label, centered)
     let volume_scale = gtk::Scale::builder()
         .orientation(gtk::Orientation::Horizontal)
         .halign(gtk::Align::Center)
@@ -403,6 +441,8 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
         .draw_value(false)
         .css_classes(["volume-bar"])
         .build();
+    volume_scale.update_property(&[gtk::accessible::Property::Label("Volume")]);
+    volume_scale.set_accessible_role(gtk::AccessibleRole::Slider);
     volume_scale.set_range(0.0, 1.0);
     volume_scale.set_value(1.0);
     {
@@ -428,9 +468,11 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
 
     let mute_btn = gtk::Button::builder()
         .icon_name("audio-volume-muted-symbolic")
-        .tooltip_text("Mute/Unmute")
+        .tooltip_text("Mute/Unmute (M)")
         .css_classes(["ctrl-btn"])
         .build();
+    mute_btn.update_property(&[gtk::accessible::Property::Label("Mute")]);
+    mute_btn.set_accessible_role(gtk::AccessibleRole::Button);
     {
         let state = state.clone();
         let volume_scale = volume_scale.clone();
@@ -450,10 +492,8 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
             state.borrow_mut().skip_volume_update = true;
             if new_muted {
                 volume_scale.set_value(0.0);
-            } else {
-                if let Some(ref media) = media {
-                    volume_scale.set_value(media.volume() as f64);
-                }
+            } else if let Some(ref media) = media {
+                volume_scale.set_value(media.volume());
             }
             state.borrow_mut().skip_volume_update = false;
         });
@@ -485,7 +525,7 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
         s.toast_overlay = Some(toast_overlay.clone());
     }
 
-    // ── Auto-hide + mouse tracking (Showtime-style) ──
+    // ── Auto-hide + mouse tracking (Showtime-style, overlay transparent, no push) ──
     const FADE_DELAY_MS: u32 = 3000;
     const EDGE_THRESHOLD: f64 = 0.25;
     {
@@ -655,7 +695,7 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
         let picture = picture.clone();
         let scrolled = scrolled.clone();
         let window_clone = window.clone();
-        let empty_label = empty_label.clone();
+        let empty_status_clone = empty_status.clone();
         drop_target.connect_drop(move |_, value, _, _| {
             if let Ok(file_list) = value.get::<gdk::FileList>() {
                 let paths: Vec<PathBuf> = file_list
@@ -694,7 +734,7 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
                 scrolled.hadjustment().set_value(0.0);
                 scrolled.vadjustment().set_value(0.0);
                 scrolled.set_visible(true);
-                empty_label.set_visible(false);
+                empty_status_clone.set_visible(false);
                 show_file(&state, &picture, &scrolled, &window_clone);
                 return true;
             }
@@ -712,7 +752,7 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
                 .application_name("Carosello")
                 .application_icon("io.github.grigio.carosello")
                 .developer_name("Carosello Contributors")
-                .version("0.1.0")
+                .version(env!("CARGO_PKG_VERSION"))
                 .copyright("© 2026 Carosello Contributors")
                 .license_type(gtk::License::Gpl30)
                 .website("https://github.com/grigio/carosello")
@@ -738,9 +778,146 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
     }
     window.add_action(&close_action);
 
+    // Open file via portal (GtkFileDialog) — HIG blocker
+    let open_action = gio::SimpleAction::new("open", None);
+    {
+        let state = state.clone();
+        let picture = picture.clone();
+        let scrolled = scrolled.clone();
+        let window_clone = window.clone();
+        open_action.connect_activate(move |_, _| {
+            let dialog = gtk::FileDialog::builder()
+                .title("Open Image or Video")
+                .modal(true)
+                .build();
+            let filters = gio::ListStore::new::<gtk::FileFilter>();
+            let img_filter = gtk::FileFilter::new();
+            img_filter.set_name(Some("Images and Videos"));
+            for pat in [
+                "*.jpg", "*.jpeg", "*.png", "*.webp", "*.gif", "*.bmp", "*.tiff", "*.tif", "*.mp4",
+                "*.webm", "*.mkv",
+            ] {
+                img_filter.add_pattern(pat);
+                img_filter.add_pattern(&pat.to_ascii_uppercase());
+            }
+            filters.append(&img_filter);
+            let all_filter = gtk::FileFilter::new();
+            all_filter.set_name(Some("All Files"));
+            all_filter.add_pattern("*");
+            filters.append(&all_filter);
+            dialog.set_filters(Some(&filters));
+            dialog.set_default_filter(Some(&img_filter));
+            let state = state.clone();
+            let picture = picture.clone();
+            let scrolled = scrolled.clone();
+            let window = window_clone.clone();
+            dialog.open(Some(&window_clone), None::<&gio::Cancellable>, move |res| {
+                if let Ok(file) = res {
+                    if let Some(path) = file.path() {
+                        let read_dir = path.parent().unwrap_or(Path::new("."));
+                        let mut files: Vec<PathBuf> = std::fs::read_dir(read_dir)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|e| e.ok())
+                            .map(|e| e.path())
+                            .filter(|p| p.is_file() && is_media(p))
+                            .collect();
+                        if files.is_empty() {
+                            files = vec![path.clone()];
+                            if !is_media(&path) {
+                                if let Some(ref ov) = state.borrow().toast_overlay {
+                                    let toast = adw::Toast::new("Unsupported file type");
+                                    ov.add_toast(toast);
+                                }
+                                return;
+                            }
+                        }
+                        files.sort();
+                        let start_index = files.iter().position(|f| f == &path).unwrap_or(0);
+                        {
+                            let mut s = state.borrow_mut();
+                            s.files = files;
+                            s.index = start_index;
+                            s.zoom = 1.0;
+                        }
+                        scrolled.hadjustment().set_value(0.0);
+                        scrolled.vadjustment().set_value(0.0);
+                        if let Some(ref st) = state.borrow().empty_status.clone() {
+                            st.set_visible(false);
+                        }
+                        scrolled.set_visible(true);
+                        show_file(&state, &picture, &scrolled, &window);
+                    }
+                }
+            });
+        });
+    }
+    window.add_action(&open_action);
+
+    // Shortcuts dialog — HIG §Keyboard
+    let shortcuts_action = gio::SimpleAction::new("shortcuts", None);
+    {
+        let w = window.clone();
+        shortcuts_action.connect_activate(move |_, _| {
+            // Prefer AdwShortcutsDialog if available, fall back to AlertDialog
+            // Using AlertDialog keeps compatibility with libadwaita 1.5 bindings
+            let dlg = adw::AlertDialog::builder()
+                .heading("Keyboard Shortcuts")
+                .body("Navigation:\n  ← / →, Page Up / Down  —  Previous / Next\n  Home / End  —  First / Last\n  3-finger swipe  —  Previous / Next\n\nZoom:\n  Ctrl + + / −  —  Zoom In / Out\n  Ctrl + 0  —  Reset Zoom\n  Ctrl + Scroll  —  Zoom\n  Pinch  —  Zoom\n  Double-click  —  Toggle 2.5×\n  Drag  —  Pan when zoomed\n\nView:\n  F11 / F  —  Fullscreen\n  Esc  —  Reset Zoom\n\nVideo:\n  Space / K  —  Play / Pause\n  M  —  Mute\n  [ / ]  —  Seek 5 s\n  Click seek bar  —  Seek\n\nApplication:\n  Ctrl + O  —  Open File\n  Ctrl + Q  —  Quit\n  Ctrl + W  —  Close\n  Ctrl + ? / Ctrl + K  —  This Help\n  F1  —  About")
+                .build();
+            dlg.add_response("close", "Close");
+            dlg.set_close_response("close");
+            dlg.present(Some(&w));
+        });
+    }
+    window.add_action(&shortcuts_action);
+
+    // Zoom actions for discoverability via app.set_accels
+    {
+        let state = state.clone();
+        let picture = picture.clone();
+        let scrolled = scrolled.clone();
+        let zoom_in = gio::SimpleAction::new("zoom-in", None);
+        zoom_in.connect_activate(move |_, _| zoom_by(&state, &picture, &scrolled, 1.25, None));
+        window.add_action(&zoom_in);
+    }
+    {
+        let state = state.clone();
+        let picture = picture.clone();
+        let scrolled = scrolled.clone();
+        let zoom_out = gio::SimpleAction::new("zoom-out", None);
+        zoom_out
+            .connect_activate(move |_, _| zoom_by(&state, &picture, &scrolled, 1.0 / 1.25, None));
+        window.add_action(&zoom_out);
+    }
+    {
+        let state = state.clone();
+        let picture = picture.clone();
+        let scrolled = scrolled.clone();
+        let zoom_reset = gio::SimpleAction::new("zoom-reset", None);
+        zoom_reset.connect_activate(move |_, _| zoom_to(&state, &picture, &scrolled, 1.0, None));
+        window.add_action(&zoom_reset);
+    }
+
+    // Accelerators (HIG discoverability)
+    app.set_accels_for_action("win.open", &["<Control>o"]);
+    app.set_accels_for_action(
+        "win.shortcuts",
+        &["<Control>question", "<Control>slash", "<Control>k"],
+    );
+    app.set_accels_for_action("win.about", &["F1"]);
+    app.set_accels_for_action("app.quit", &["<Control>q"]);
+    app.set_accels_for_action("win.close", &["<Control>w"]);
+    app.set_accels_for_action(
+        "win.zoom-in",
+        &["<Control>plus", "<Control>equal", "<Control>KP_Add"],
+    );
+    app.set_accels_for_action("win.zoom-out", &["<Control>minus", "<Control>KP_Subtract"]);
+    app.set_accels_for_action("win.zoom-reset", &["<Control>0", "<Control>KP_0"]);
+
     let has_files = !state.borrow().files.is_empty();
     scrolled.set_visible(has_files);
-    empty_label.set_visible(!has_files);
+    empty_status.set_visible(!has_files);
 
     if has_files {
         state.borrow_mut().index = start_index;
@@ -755,13 +932,41 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
         let scrolled = scrolled.clone();
         let window = window.clone();
         key_ctrl.connect_key_pressed(move |_, key, _, modifier| match key {
-            // Navigation
-            gdk::Key::Left => {
+            // Navigation: Left/Right, PageUp/PageDown, Home/End (HIG)
+            gdk::Key::Left | gdk::Key::Page_Up => {
                 nav(&state, &picture, &scrolled, &window, -1);
                 glib::Propagation::Stop
             }
-            gdk::Key::Right => {
+            gdk::Key::Right | gdk::Key::Page_Down => {
                 nav(&state, &picture, &scrolled, &window, 1);
+                glib::Propagation::Stop
+            }
+            gdk::Key::Home => {
+                let len = state.borrow().files.len();
+                if len > 0 {
+                    {
+                        let mut s = state.borrow_mut();
+                        s.index = 0;
+                        s.zoom = 1.0;
+                    }
+                    scrolled.hadjustment().set_value(0.0);
+                    scrolled.vadjustment().set_value(0.0);
+                    show_file(&state, &picture, &scrolled, &window);
+                }
+                glib::Propagation::Stop
+            }
+            gdk::Key::End => {
+                let len = state.borrow().files.len();
+                if len > 0 {
+                    {
+                        let mut s = state.borrow_mut();
+                        s.index = len - 1;
+                        s.zoom = 1.0;
+                    }
+                    scrolled.hadjustment().set_value(0.0);
+                    scrolled.vadjustment().set_value(0.0);
+                    show_file(&state, &picture, &scrolled, &window);
+                }
                 glib::Propagation::Stop
             }
             // Fullscreen
@@ -769,16 +974,20 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
                 window.set_fullscreened(!window.is_fullscreen());
                 glib::Propagation::Stop
             }
-            // Zoom: Ctrl++ / Ctrl+- / Ctrl+0 (HIG standard)
-            gdk::Key::plus | gdk::Key::equal | gdk::Key::KP_Add => {
+            // Zoom: Ctrl++ / Ctrl+- / Ctrl+0 (HIG standard, gated behind Ctrl)
+            gdk::Key::plus | gdk::Key::equal | gdk::Key::KP_Add
+                if modifier.contains(gdk::ModifierType::CONTROL_MASK) =>
+            {
                 zoom_by(&state, &picture, &scrolled, 1.25, None);
                 glib::Propagation::Stop
             }
-            gdk::Key::minus | gdk::Key::underscore | gdk::Key::KP_Subtract => {
+            gdk::Key::minus | gdk::Key::underscore | gdk::Key::KP_Subtract
+                if modifier.contains(gdk::ModifierType::CONTROL_MASK) =>
+            {
                 zoom_by(&state, &picture, &scrolled, 1.0 / 1.25, None);
                 glib::Propagation::Stop
             }
-            gdk::Key::_0 | gdk::Key::KP_0 => {
+            gdk::Key::_0 | gdk::Key::KP_0 if modifier.contains(gdk::ModifierType::CONTROL_MASK) => {
                 zoom_to(&state, &picture, &scrolled, 1.0, None);
                 glib::Propagation::Stop
             }
@@ -810,8 +1019,64 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
                 }
                 glib::Propagation::Stop
             }
-            // Mute toggle
+            // Shortcuts dialog: Ctrl+K (HIG) — must be before K play/pause
+            gdk::Key::k if modifier.contains(gdk::ModifierType::CONTROL_MASK) => {
+                gio::prelude::ActionGroupExt::activate_action(&window, "shortcuts", None);
+                glib::Propagation::Stop
+            }
+            // Play/Pause: Space / K (YouTube/Showtime/Loupe HIG)
             gdk::Key::space => {
+                let s = state.borrow();
+                if let Some(ref media) = s.media_file {
+                    if s.is_video {
+                        let is_playing = media.is_playing();
+                        let btn = s.play_pause_btn.clone();
+                        let media_clone = media.clone();
+                        drop(s);
+                        if is_playing {
+                            media_clone.pause();
+                            if let Some(btn) = btn {
+                                btn.set_icon_name("media-playback-start-symbolic");
+                                btn.set_tooltip_text(Some("Play (Space)"));
+                            }
+                        } else {
+                            media_clone.play();
+                            if let Some(btn) = btn {
+                                btn.set_icon_name("media-playback-pause-symbolic");
+                                btn.set_tooltip_text(Some("Pause (Space)"));
+                            }
+                        }
+                    }
+                }
+                glib::Propagation::Stop
+            }
+            gdk::Key::k => {
+                let s = state.borrow();
+                if let Some(ref media) = s.media_file {
+                    if s.is_video {
+                        let is_playing = media.is_playing();
+                        let btn = s.play_pause_btn.clone();
+                        let media_clone = media.clone();
+                        drop(s);
+                        if is_playing {
+                            media_clone.pause();
+                            if let Some(btn) = btn {
+                                btn.set_icon_name("media-playback-start-symbolic");
+                                btn.set_tooltip_text(Some("Play (K)"));
+                            }
+                        } else {
+                            media_clone.play();
+                            if let Some(btn) = btn {
+                                btn.set_icon_name("media-playback-pause-symbolic");
+                                btn.set_tooltip_text(Some("Pause (K)"));
+                            }
+                        }
+                    }
+                }
+                glib::Propagation::Stop
+            }
+            // Mute toggle: m (HIG) — Space no longer mutes
+            gdk::Key::m => {
                 let (new_muted, media, btn, scale) = {
                     let s = state.borrow();
                     let media = s.media_file.clone();
@@ -834,10 +1099,8 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
                 if let Some(ref scale) = scale {
                     if new_muted {
                         scale.set_value(0.0);
-                    } else {
-                        if let Some(ref media) = media {
-                            scale.set_value(media.volume() as f64);
-                        }
+                    } else if let Some(ref media) = media {
+                        scale.set_value(media.volume());
                     }
                 }
                 state.borrow_mut().skip_volume_update = false;
@@ -855,27 +1118,6 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
                 }
                 glib::Propagation::Stop
             }
-            gdk::Key::k => {
-                let s = state.borrow();
-                if let Some(ref media) = s.media_file {
-                    if s.is_video {
-                        if media.is_playing() {
-                            media.pause();
-                            if let Some(ref btn) = s.play_pause_btn {
-                                btn.set_icon_name("media-playback-start-symbolic");
-                                btn.set_tooltip_text(Some("Play"));
-                            }
-                        } else {
-                            media.play();
-                            if let Some(ref btn) = s.play_pause_btn {
-                                btn.set_icon_name("media-playback-pause-symbolic");
-                                btn.set_tooltip_text(Some("Pause"));
-                            }
-                        }
-                    }
-                }
-                glib::Propagation::Stop
-            }
             gdk::Key::bracketright => {
                 let s = state.borrow();
                 if let Some(ref media) = s.media_file {
@@ -886,6 +1128,18 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
                         media.seek(seek_to);
                     }
                 }
+                glib::Propagation::Stop
+            }
+            // Open file: Ctrl+O (portal)
+            gdk::Key::o if modifier.contains(gdk::ModifierType::CONTROL_MASK) => {
+                gio::prelude::ActionGroupExt::activate_action(&window, "open", None);
+                glib::Propagation::Stop
+            }
+            // Shortcuts help: Ctrl+? / Ctrl+/ (HIG)
+            gdk::Key::question | gdk::Key::slash
+                if modifier.contains(gdk::ModifierType::CONTROL_MASK) =>
+            {
+                gio::prelude::ActionGroupExt::activate_action(&window, "shortcuts", None);
                 glib::Propagation::Stop
             }
             _ => glib::Propagation::Proceed,
@@ -946,6 +1200,31 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
     }
     scrolled.add_controller(scroll_ctrl);
 
+    // ── Ctrl+Scroll zoom (HIG) ──
+    let zoom_scroll_ctrl = gtk::EventControllerScroll::builder()
+        .flags(gtk::EventControllerScrollFlags::VERTICAL)
+        .propagation_phase(gtk::PropagationPhase::Capture)
+        .build();
+    {
+        let state = state.clone();
+        let picture = picture.clone();
+        let scrolled = scrolled.clone();
+        let ctrl = zoom_scroll_ctrl.clone();
+        zoom_scroll_ctrl.connect_scroll(move |_, _, dy| {
+            let is_ctrl = ctrl
+                .current_event()
+                .map(|e| e.modifier_state().contains(gdk::ModifierType::CONTROL_MASK))
+                .unwrap_or(false);
+            if !is_ctrl {
+                return glib::Propagation::Proceed;
+            }
+            let factor = if dy < 0.0 { 1.1 } else { 1.0 / 1.1 };
+            zoom_by(&state, &picture, &scrolled, factor, None);
+            glib::Propagation::Stop
+        });
+    }
+    scrolled.add_controller(zoom_scroll_ctrl);
+
     // ── Pinch-to-zoom ──
     let zoom_gesture = gtk::GestureZoom::new();
     {
@@ -967,7 +1246,7 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
             let base_zoom = base_zoom.clone();
             zoom_gesture.connect_scale_changed(move |gesture, scale| {
                 let target = (base_zoom.get() * scale).clamp(state::ZOOM_MIN, state::ZOOM_MAX);
-                let anchor = if gesture.device().map_or(false, |d| d.has_cursor()) {
+                let anchor = if gesture.device().is_some_and(|d| d.has_cursor()) {
                     let s = state.borrow();
                     Some((s.mouse_x, s.mouse_y))
                 } else {
@@ -1085,7 +1364,7 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
         });
     }
 
-    // ── Resize handling (viewport-driven) ──
+    // ── Resize handling: refit media to available viewport on any window/viewport change ──
     {
         let state = state.clone();
         let picture = picture.clone();
@@ -1100,6 +1379,58 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
         let scrolled_w = scrolled.clone();
         scrolled.connect_notify_local(Some("height"), move |_, _| {
             notify_resize(&state, &picture, &scrolled_w);
+        });
+    }
+    // Window size changes (drag, tiled, maximized, fullscreen) also refit.
+    {
+        let state = state.clone();
+        let picture = picture.clone();
+        let scrolled_w = scrolled.clone();
+        window.connect_notify_local(Some("maximized"), move |_, _| {
+            schedule_update(&state, &picture, &scrolled_w);
+        });
+    }
+    {
+        let state = state.clone();
+        let picture = picture.clone();
+        let scrolled_w = scrolled.clone();
+        window.connect_notify_local(Some("fullscreened"), move |_, _| {
+            schedule_update(&state, &picture, &scrolled_w);
+        });
+    }
+    {
+        let state = state.clone();
+        let picture = picture.clone();
+        let scrolled_w = scrolled.clone();
+        window.connect_notify_local(Some("default-width"), move |_, _| {
+            schedule_update(&state, &picture, &scrolled_w);
+        });
+    }
+    {
+        let state = state.clone();
+        let picture = picture.clone();
+        let scrolled_w = scrolled.clone();
+        window.connect_notify_local(Some("default-height"), move |_, _| {
+            schedule_update(&state, &picture, &scrolled_w);
+        });
+    }
+    // GTK Widget width/height also tracks allocation – handle for drag-resize.
+    {
+        let state = state.clone();
+        let picture = picture.clone();
+        let scrolled_w = scrolled.clone();
+        let win_w = window.clone().upcast::<gtk::Widget>();
+        win_w.connect_notify_local(Some("width"), move |_, _| {
+            schedule_update(&state, &picture, &scrolled_w);
+        });
+    }
+    {
+        let state = state.clone();
+        let picture = picture.clone();
+        let scrolled_w = scrolled.clone();
+        let win_w = window.clone().upcast::<gtk::Widget>();
+        win_w.connect_notify_local(Some("height"), move |_, _| {
+            schedule_update(&state, &picture, &scrolled_w);
         });
     }
 
@@ -1148,7 +1479,13 @@ fn zoom_by(
         return;
     }
     let cur = state.borrow().zoom;
-    zoom_to(state, picture, scrolled, state::clamp_zoom(cur * factor), anchor);
+    zoom_to(
+        state,
+        picture,
+        scrolled,
+        state::clamp_zoom(cur * factor),
+        anchor,
+    );
 }
 
 fn zoom_to(
@@ -1164,7 +1501,10 @@ fn zoom_to(
         if s.original_pixbuf.is_none() && s.media_file.is_none() {
             return;
         }
-        let iw = s.original_pixbuf.as_ref().map(|pb| (pb.width().max(1) as f64, pb.height().max(1) as f64));
+        let iw = s
+            .original_pixbuf
+            .as_ref()
+            .map(|pb| (pb.width().max(1) as f64, pb.height().max(1) as f64));
         let vid = if s.is_video {
             if s.video_w > 0 && s.video_h > 0 {
                 Some((s.video_w as f64, s.video_h as f64))
@@ -1258,17 +1598,38 @@ fn show_file(
     let (path, idx, total) = {
         let s = state.borrow();
         if s.files.is_empty() {
+            // Show empty state
+            if let Some(ref st) = s.empty_status {
+                st.set_visible(true);
+            }
+            scrolled.set_visible(false);
+            window.set_title(Some("Carosello"));
+            if let Some(ref wt) = s.window_title {
+                wt.set_title("Carosello");
+                wt.set_subtitle("");
+            }
             return;
         }
         (s.files[s.index].clone(), s.index, s.files.len())
     };
+
+    // Ensure content visible, empty hidden
+    if let Some(ref st) = state.borrow().empty_status.clone() {
+        st.set_visible(false);
+    }
+    scrolled.set_visible(true);
 
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("")
         .to_string();
-    window.set_title(Some(&format!("{} — {}/{}", name, idx + 1, total)));
+    // HIG: WindowTitle shows filename + counter as subtitle, WM title is just filename
+    window.set_title(Some(&name));
+    if let Some(ref wt) = state.borrow().window_title.clone() {
+        wt.set_title(&name);
+        wt.set_subtitle(&format!("{} of {}", idx + 1, total));
+    }
 
     if state::has_ext(&path, state::VIDEO_EXTS) {
         show_video(state, picture, scrolled, &path);
@@ -1317,7 +1678,10 @@ fn show_image(
             picture.set_paintable(none);
             // Show toast on error (GNOME HIG feedback pattern)
             if let Some(ref overlay) = s.toast_overlay {
-                let toast = adw::Toast::new(&format!("Failed to load {}", path.file_name().unwrap_or_default().to_string_lossy()));
+                let toast = adw::Toast::new(&format!(
+                    "Failed to load {}",
+                    path.file_name().unwrap_or_default().to_string_lossy()
+                ));
                 toast.set_timeout(3);
                 overlay.add_toast(toast);
             }
@@ -1325,13 +1689,39 @@ fn show_image(
     }
 }
 
-fn notify_resize(state: &Rc<RefCell<AppState>>, picture: &gtk::Picture, scrolled: &gtk::ScrolledWindow) {
-    let mut s = state.borrow_mut();
-    let w = scrolled.width();
-    let h = scrolled.height();
-    if w <= 1 || h <= 1 {
+fn viewport_size(scrolled: &gtk::ScrolledWindow) -> (f64, f64) {
+    let mut vw = scrolled.width() as f64;
+    let mut vh = scrolled.height() as f64;
+    if vw < 1.0 || vh < 1.0 {
+        if let Some(root) = scrolled.root() {
+            // Try to fall back to toplevel window size (available window space)
+            if let Some(win) = root.downcast_ref::<gtk::Window>() {
+                let w = win.width() as f64;
+                let h = win.height() as f64;
+                if w >= 1.0 && h >= 1.0 {
+                    // Window includes decorations/header overlay; approximate viewport
+                    // by using window size. Scrolled is full-window overlay, so this is accurate.
+                    vw = w;
+                    vh = h;
+                }
+            }
+        }
+    }
+    (vw, vh)
+}
+
+fn notify_resize(
+    state: &Rc<RefCell<AppState>>,
+    picture: &gtk::Picture,
+    scrolled: &gtk::ScrolledWindow,
+) {
+    let (vw, vh) = viewport_size(scrolled);
+    if vw < 1.0 || vh < 1.0 {
         return;
     }
+    let w = vw as i32;
+    let h = vh as i32;
+    let mut s = state.borrow_mut();
     let changed = s.last_w != w || s.last_h != h;
     if changed {
         s.last_w = w;
@@ -1378,8 +1768,7 @@ fn update_display(
             s.video_h = ih as i32;
         }
     }
-    let vw = scrolled.width() as f64;
-    let vh = scrolled.height() as f64;
+    let (vw, vh) = viewport_size(scrolled);
     if vw < 1.0 || vh < 1.0 {
         return;
     }
@@ -1500,67 +1889,42 @@ fn show_video(
         let state = state.clone();
         let picture = picture.clone();
         let scrolled = scrolled.clone();
-        media.connect_invalidate_size(move |_| {
-            debug_log("video: invalidate-size");
-            schedule_update(&state, &picture, &scrolled);
+        media.connect_invalidate_size({
+            let state = state.clone();
+            let picture = picture.clone();
+            let scrolled = scrolled.clone();
+            move |_| {
+                debug_log("video: invalidate-size");
+                schedule_update(&state, &picture, &scrolled);
+            }
         });
-    }
-
-    // TEMP-DIAG hook (removed before release): programmatic zoom.
-    if std::env::var("CAROSELLO_DEBUG_ZOOM").is_ok() {
-        let state = state.clone();
-        let picture = picture.clone();
-        let scrolled = scrolled.clone();
-        glib::timeout_add_local_once(Duration::from_millis(2500), move || {
-            zoom_to(&state, &picture, &scrolled, 2.5, None);
+        let state2 = state.clone();
+        let picture2 = picture.clone();
+        let scrolled2 = scrolled.clone();
+        let media2 = media.clone();
+        media.connect_invalidate_contents(move |_| {
+            if let Some((w, h)) = zoom::video_intrinsic(&media2) {
+                let (wi, hi) = (w as i32, h as i32);
+                let stored = {
+                    let s = state2.borrow();
+                    (s.video_w, s.video_h)
+                };
+                if (wi, hi) != stored {
+                    {
+                        let mut s = state2.borrow_mut();
+                        s.video_w = wi;
+                        s.video_h = hi;
+                    }
+                    debug_log(&format!("video: size discovered {wi}x{hi}"));
+                    schedule_update(&state2, &picture2, &scrolled2);
+                }
+            }
         });
     }
 
     // Seek bar update timer (generation-guarded so old timers die on nav).
     let state_clone = state.clone();
-    let picture_clone = picture.clone();
-    let scrolled_clone = scrolled.clone();
     glib::timeout_add_local(Duration::from_millis(200), move || {
-        // Size poll
-        let size_changed = {
-            let (media_opt, stored, gen_now, is_vid) = {
-                let s = state_clone.borrow();
-                (
-                    s.media_file.clone(),
-                    (s.video_w, s.video_h),
-                    s.video_gen,
-                    s.is_video,
-                )
-            };
-            if gen_now != gen || !is_vid {
-                return glib::ControlFlow::Break;
-            }
-            match media_opt.as_ref().and_then(zoom::video_intrinsic) {
-                Some((w, h)) => {
-                    let (wi, hi) = (w as i32, h as i32);
-                    if (wi, hi) != stored {
-                        let mut s = state_clone.borrow_mut();
-                        if s.video_gen == gen && s.is_video {
-                            s.video_w = wi;
-                            s.video_h = hi;
-                            debug_log(&format!(
-                                "video: size discovered {wi}x{hi} prepared={}",
-                                media_opt.as_ref().map(|m| m.is_prepared()).unwrap_or(false)
-                            ));
-                            true
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    }
-                }
-                None => false,
-            }
-        };
-        if size_changed {
-            schedule_update(&state_clone, &picture_clone, &scrolled_clone);
-        }
         let (
             media_opt,
             seeking,

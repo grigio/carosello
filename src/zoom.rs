@@ -151,12 +151,12 @@ pub fn intrinsic_size(
         .map(|pb| (pb.width().max(1) as f64, pb.height().max(1) as f64))
 }
 
-/// Fit size preserving aspect ratio, never upscaling small media.
+/// Fit size preserving aspect ratio to fill available viewport.
 pub fn fit_size(iw: f64, ih: f64, vw: f64, vh: f64) -> (f64, f64) {
     if iw < 1.0 || ih < 1.0 || vw < 1.0 || vh < 1.0 {
         return (iw.max(1.0), ih.max(1.0));
     }
-    let scale = (vw / iw).min(vh / ih).min(1.0);
+    let scale = (vw / iw).min(vh / ih);
     ((iw * scale).max(1.0), (ih * scale).max(1.0))
 }
 

@@ -8,3 +8,6 @@ Type=Application
 Categories=Graphics;Viewer;
 Keywords=image;video;viewer;photo;
 MimeType=image/jpeg;image/png;image/webp;image/gif;image/bmp;image/tiff;video/mp4;video/webm;video/x-matroska;
+DBusActivatable=true
+StartupWMClass=io.github.grigio.carosello
+X-GNOME-UsesNotifications=true
