@@ -16,6 +16,7 @@ finish-args:
   - --share=ipc
   - --socket=wayland
   - --socket=fallback-x11
+  - --socket=pulseaudio
   - --device=dri
   - --talk-name=org.freedesktop.secrets
   # Read-write host access so the app can list sibling images/videos

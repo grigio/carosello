@@ -535,6 +535,7 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
             let hide_id = hide_id.clone();
             let state = state.clone();
             let window_ref = window.clone();
+            let menu = menu_btn.clone();
             motion_ctrl.connect_motion(move |_, x, y| {
                 {
                     let mut s = state.borrow_mut();
@@ -555,7 +556,7 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
                     }
                 }
                 if !in_top_zone && !in_bottom_zone {
-                    arm_hide(&top, &bottom, &hide_id, FADE_DELAY_MS);
+                    arm_hide(&top, &bottom, &hide_id, FADE_DELAY_MS, &menu);
                 }
             });
         }
@@ -584,8 +585,9 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
                 let top = top.clone();
                 let bottom = bottom_outer.clone();
                 let hide_id = hide_id.clone();
+                let menu = menu_btn.clone();
                 motion_top.connect_leave(move |_| {
-                    arm_hide(&top, &bottom, &hide_id, FADE_DELAY_MS);
+                    arm_hide(&top, &bottom, &hide_id, FADE_DELAY_MS, &menu);
                 });
             }
             top_handle.add_controller(motion_top);
@@ -612,17 +614,40 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
                 let bottom = bottom.clone();
                 let top = top_handle.clone();
                 let hide_id = hide_id.clone();
+                let menu = menu_btn.clone();
                 motion_bottom.connect_leave(move |_| {
-                    arm_hide(&top, &bottom, &hide_id, FADE_DELAY_MS);
+                    arm_hide(&top, &bottom, &hide_id, FADE_DELAY_MS, &menu);
                 });
             }
             bottom_outer.add_controller(motion_bottom);
         }
 
+        // While the menu popup is open the panel stays visible.
+        {
+            let top = top_handle.clone();
+            let bottom = bottom_outer.clone();
+            let hide_id = hide_id.clone();
+            menu_btn.connect_active_notify(move |btn| {
+                if btn.is_active() {
+                    cancel_hide(&hide_id);
+                    top.set_opacity(1.0);
+                    if bottom.is_visible() {
+                        bottom.set_opacity(1.0);
+                    }
+                } else {
+                    arm_hide(&top, &bottom, &hide_id, FADE_DELAY_MS, btn);
+                }
+            });
+        }
+
         // When mouse leaves the window, fade out both panels quickly
         let motion_leave = gtk::EventControllerMotion::new();
         {
+            let menuc = menu_btn.clone();
             motion_leave.connect_leave(move |_| {
+                if menuc.is_active() {
+                    return;
+                }
                 top.set_opacity(0.0);
                 bottom.set_opacity(0.0);
             });
@@ -1426,6 +1451,13 @@ fn set_muted_state(state: &Rc<RefCell<AppState>>, muted: bool) {
         )
     };
     if let Some(ref media) = media {
+        // Unmuting with the volume at zero stays silent (volume 0 + muted
+        // false). This happens after dragging the slider to 0, which sets
+        // volume 0 and muted, then pressing M / the mute button: restoring
+        // the slider to media.volume() keeps it at 0. Restore full volume.
+        if !muted && media.volume() < 0.01 {
+            media.set_volume(1.0);
+        }
         media.set_muted(muted);
     }
     if let Some(btn) = btn {
@@ -1571,12 +1603,19 @@ fn arm_hide(
     bottom: &gtk::Box,
     hide_id: &Rc<Cell<Option<glib::SourceId>>>,
     delay_ms: u32,
+    menu: &gtk::MenuButton,
 ) {
     cancel_hide(hide_id);
     let topc = top.clone();
     let bottomc = bottom.clone();
     let hide_id2 = hide_id.clone();
+    let menuc = menu.clone();
     let sid = glib::timeout_add_local(Duration::from_millis(delay_ms as u64), move || {
+        // While the menu popup is open the panel stays visible (no hide under it).
+        if menuc.is_active() {
+            hide_id2.set(None);
+            return glib::ControlFlow::Break;
+        }
         // Opacity-only fade; widgets stay in place so overlay layout/push is unchanged.
         topc.set_opacity(0.0);
         bottomc.set_opacity(0.0);
