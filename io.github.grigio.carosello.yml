@@ -18,15 +18,20 @@ finish-args:
   - --socket=fallback-x11
   - --device=dri
   - --talk-name=org.freedesktop.secrets
-  # Read-only host access so the app can list sibling images/videos
+  # Read-write host access so the app can list sibling images/videos
   # in the containing directory of an opened file, wherever it lives
-  # (Pictures, Downloads, /media, /mnt, project dirs, ...).
+  # (Pictures, Downloads, /media, /mnt, project dirs, ...), and move
+  # files to Trash via GFile trash (needs write on the directory).
   # A per-directory grant (xdg-pictures/videos/download only) breaks
   # sibling navigation: the FileChooser portal grants just the single
   # picked file, and read_dir(parent) fails outside those dirs.
-  - --filesystem=host:ro
-  # Remote/virtual mounts (sftp, smb, ...) via GVfs
+  - --filesystem=host:rw
+  # Remote/virtual mounts (sftp, smb, ...) via GVfs.
+  # Both entries are needed: gvfs holds the mount points, gvfsd the
+  # daemon sockets (without it every GFile call logs a GVFS-WARNING
+  # about missing --filesystem=xdg-run/gvfsd privileges).
   - --filesystem=xdg-run/gvfs:ro
+  - --filesystem=xdg-run/gvfsd
   - --talk-name=org.gtk.vfs
   - --talk-name=org.gtk.vfs.*
 

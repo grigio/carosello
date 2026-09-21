@@ -1,6 +1,6 @@
 [package]
 name = "carosello"
-version = "1.0.6"
+version = "1.0.7"
 edition = "2021"
 description = "A fast, minimalist image and video viewer for Linux"
 license = "GPL-3.0-or-later"
@@ -14,3 +14,11 @@ gtk = { package = "gtk4", version = "0.9", features = ["gnome_45"] }
 gdk-pixbuf = { package = "gdk-pixbuf", version = "0.20" }
 libadwaita = { version = "0.7", features = ["v1_5"] }
 kamadak-exif = "0.6"
+
+[profile.release]
+lto = true
+strip = true
+panic = "abort"
+
+[lints.clippy]
+pedantic = { level = "allow", priority = 0 }

@@ -35,6 +35,11 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="1.0.7" date="2026-09-21">
+      <description>
+        <p>Move the current item to Trash with Del, staying on the next item instead of resetting to the first.</p>
+      </description>
+    </release>
     <release version="1.0.6" date="2026-09-21">
       <description>
         <p>Embed CSS in the binary so release artifacts are styled without an installed GResource bundle.</p>

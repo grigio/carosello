@@ -24,13 +24,28 @@ pub fn load_css() {
         }
     }
 
-    // 2. Fall back to data/style.css (cargo dev builds, live reload)
+    // 2. Fall back to data/style.css next to the binary or CWD
+    // (cargo dev builds, live reload). Check exe dir first so the app works
+    // regardless of the launch directory.
     if !loaded {
+        let mut candidates = Vec::new();
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                candidates.push(dir.join("data").join("style.css"));
+                // meson dev layout: <builddir>/src/carosello next to source?
+                if let Some(parent) = dir.parent() {
+                    candidates.push(parent.join("data").join("style.css"));
+                }
+            }
+        }
         if let Ok(cwd) = std::env::current_dir() {
-            let css_path = cwd.join("data").join("style.css");
+            candidates.push(cwd.join("data").join("style.css"));
+        }
+        for css_path in candidates {
             if css_path.exists() {
                 provider.load_from_path(css_path.to_str().unwrap_or("data/style.css"));
                 loaded = true;
+                break;
             }
         }
     }

@@ -1,4 +1,5 @@
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
@@ -18,15 +19,18 @@ struct AppState {
     files: Vec<PathBuf>,
     index: usize,
     original_pixbuf: Option<gdk_pixbuf::Pixbuf>,
+    image_w: i32,
+    image_h: i32,
+    image_gen: u64,
+    prefetch: HashMap<PathBuf, gdk_pixbuf::Pixbuf>,
     zoom: f64,
     media_file: Option<gtk::MediaFile>,
-    video_view: Option<ZoomPaintable>,
+    video_view: ZoomPaintable,
     last_w: i32,
     last_h: i32,
     pending_update: bool,
     is_video: bool,
     seeking: bool,
-    updating_seek_bar: bool,
     skip_volume_update: bool,
     video_gen: u64,
     video_w: i32,
@@ -52,15 +56,18 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
         files: Vec::new(),
         index: 0,
         original_pixbuf: None,
+        image_w: 0,
+        image_h: 0,
+        image_gen: 0,
+        prefetch: HashMap::new(),
         zoom: 1.0,
         media_file: None,
-        video_view: Some(ZoomPaintable::new()),
+        video_view: ZoomPaintable::new(),
         last_w: 0,
         last_h: 0,
         pending_update: false,
         is_video: false,
         seeking: false,
-        updating_seek_bar: false,
         skip_volume_update: false,
         video_gen: 0,
         video_w: 0,
@@ -87,14 +94,7 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
             Some(p) => (p, None),
             None => (Path::new("."), None),
         };
-        let mut files: Vec<PathBuf> = std::fs::read_dir(read_dir)
-            .into_iter()
-            .flatten()
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.is_file() && is_media(p))
-            .collect();
-        files.sort();
+        let files = state::collect_media(read_dir);
         if let Some(target) = target_file {
             start_index = files.iter().position(|f| f == &target).unwrap_or(0);
         }
@@ -236,6 +236,8 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
 
     let section = gio::Menu::new();
     section.append(Some("Open…"), Some("win.open"));
+    section.append(Some("Open Folder…"), Some("win.open-folder"));
+    section.append(Some("Move to Trash"), Some("win.trash"));
     section.append(Some("About"), Some("win.about"));
     let quit_section = gio::Menu::new();
     quit_section.append(Some("Quit"), Some("app.quit"));
@@ -305,40 +307,14 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
     seek_scale.set_accessible_role(gtk::AccessibleRole::Slider);
     seek_scale.set_range(0.0, 500.0);
     seek_scale.set_increments(1.0, 10.0);
+    // User-driven seeks via change-value (only fires for interaction, not for
+    // programmatic set_value from timestamp notifies — no feedback loop).
+    // Native click-to-seek is kept; no custom click math (RTL/padding safe).
     {
         let state = state.clone();
-        let scale = seek_scale.clone();
-        seek_scale.connect_value_changed(move |_| {
-            let value = scale.value();
-            let (media, duration, seeking, updating) = {
-                let s = state.borrow_mut();
-                (
-                    s.media_file.clone(),
-                    s.media_file.as_ref().map(|m| m.duration()).unwrap_or(0),
-                    s.seeking,
-                    s.updating_seek_bar,
-                )
-            };
-            if let Some(media) = media {
-                if duration > 0 && !seeking && !updating {
-                    let ts = (value / 500.0 * duration as f64)
-                        .max(0.0)
-                        .min(duration as f64) as i64;
-                    state.borrow_mut().seeking = true;
-                    media.seek(ts);
-                }
-            }
-        });
-    }
-
-    let click_gesture = gtk::GestureClick::new();
-    click_gesture.set_button(1);
-    {
-        let state = state.clone();
-        let scale = seek_scale.clone();
-        click_gesture.connect_pressed(move |_, _, x, _| {
+        seek_scale.connect_change_value(move |_, _, value| {
             let (media, duration) = {
-                let s = state.borrow_mut();
+                let s = state.borrow();
                 (
                     s.media_file.clone(),
                     s.media_file.as_ref().map(|m| m.duration()).unwrap_or(0),
@@ -346,27 +322,14 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
             };
             if let Some(media) = media {
                 if duration > 0 {
-                    let width = scale.width() as f64;
-                    let value = (x / width.max(1.0) * 500.0).clamp(0.0, 500.0);
-                    scale.set_value(value);
-                    let ts = (value / 500.0 * duration as f64)
-                        .max(0.0)
-                        .min(duration as f64) as i64;
+                    let ts = (value / 500.0 * duration as f64).clamp(0.0, duration as f64) as i64;
                     state.borrow_mut().seeking = true;
                     media.seek(ts);
                 }
             }
+            glib::Propagation::Proceed
         });
     }
-    {
-        let state = state.clone();
-        click_gesture.connect_released(move |_, _, _, _| {
-            let mut s = state.borrow_mut();
-            s.seeking = false;
-            s.updating_seek_bar = false;
-        });
-    }
-    seek_scale.add_controller(click_gesture);
 
     // When seek bar is focused, intercept arrow keys for navigation
     // (GtkScale's built-in handler would otherwise consume them)
@@ -417,19 +380,8 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
     play_pause_btn.set_accessible_role(gtk::AccessibleRole::Button);
     {
         let state = state.clone();
-        play_pause_btn.connect_clicked(move |btn| {
-            let s = state.borrow();
-            if let Some(ref media) = s.media_file {
-                if media.is_playing() {
-                    media.pause();
-                    btn.set_icon_name("media-playback-start-symbolic");
-                    btn.set_tooltip_text(Some("Play"));
-                } else {
-                    media.play();
-                    btn.set_icon_name("media-playback-pause-symbolic");
-                    btn.set_tooltip_text(Some("Pause"));
-                }
-            }
+        play_pause_btn.connect_clicked(move |_| {
+            toggle_play_pause(&state);
         });
     }
 
@@ -449,18 +401,19 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
         let state = state.clone();
         volume_scale.connect_value_changed(move |scale| {
             let value = scale.value();
-            let skip = state.borrow().skip_volume_update;
-            if skip {
+            if state.borrow().skip_volume_update {
                 return;
             }
-            let media = state.borrow().media_file.clone();
-            let btn = state.borrow().mute_btn.clone();
+            let (media, btn) = {
+                let s = state.borrow();
+                (s.media_file.clone(), s.mute_btn.clone())
+            };
             if let Some(media) = media {
                 let muted = value < 0.01;
                 media.set_volume(value);
                 media.set_muted(muted);
-                if let Some(ref btn) = btn {
-                    update_mute_button(btn, muted);
+                if let Some(btn) = btn {
+                    update_mute_button(&btn, muted);
                 }
             }
         });
@@ -475,27 +428,14 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
     mute_btn.set_accessible_role(gtk::AccessibleRole::Button);
     {
         let state = state.clone();
-        let volume_scale = volume_scale.clone();
-        mute_btn.connect_clicked(move |btn| {
-            let (new_muted, media) = {
-                let s = state.borrow_mut();
-                if let Some(ref media) = s.media_file {
-                    let new_muted = !media.is_muted();
-                    media.set_muted(new_muted);
-                    update_mute_button(btn, new_muted);
-                    (new_muted, Some(media.clone()))
-                } else {
-                    return;
-                }
-            };
-            // Set skip flag to prevent volume callback from re-entering
-            state.borrow_mut().skip_volume_update = true;
-            if new_muted {
-                volume_scale.set_value(0.0);
-            } else if let Some(ref media) = media {
-                volume_scale.set_value(media.volume());
-            }
-            state.borrow_mut().skip_volume_update = false;
+        mute_btn.connect_clicked(move |_| {
+            let new_muted = state
+                .borrow()
+                .media_file
+                .as_ref()
+                .map(|m| !m.is_muted())
+                .unwrap_or(false);
+            set_muted_state(&state, new_muted);
         });
     }
 
@@ -553,31 +493,14 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
                 let in_bottom_zone = at_bottom;
                 let in_any_zone = in_top_zone || in_bottom_zone;
                 if in_any_zone {
-                    if let Some(id) = hide_id.take() {
-                        id.remove();
-                    }
+                    cancel_hide(&hide_id);
                     top.set_opacity(1.0);
                     if bottom.is_visible() {
                         bottom.set_opacity(1.0);
                     }
                 }
                 if !in_top_zone && !in_bottom_zone {
-                    if let Some(id) = hide_id.take() {
-                        id.remove();
-                    }
-                    let topc = top.clone();
-                    let bottomc = bottom.clone();
-                    let hide_id2 = hide_id.clone();
-                    let sid = glib::timeout_add_local(
-                        Duration::from_millis(FADE_DELAY_MS as u64),
-                        move || {
-                            topc.set_opacity(0.0);
-                            bottomc.set_opacity(0.0);
-                            hide_id2.set(None);
-                            glib::ControlFlow::Break
-                        },
-                    );
-                    hide_id.set(Some(sid));
+                    arm_hide(&top, &bottom, &hide_id, FADE_DELAY_MS);
                 }
             });
         }
@@ -592,9 +515,7 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
                 let top = top.clone();
                 let hide_id = hide_id.clone();
                 motion_top.connect_enter(move |_, _, _| {
-                    if let Some(id) = hide_id.take() {
-                        id.remove();
-                    }
+                    cancel_hide(&hide_id);
                     top.set_opacity(1.0);
                 });
             }
@@ -609,22 +530,7 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
                 let bottom = bottom_outer.clone();
                 let hide_id = hide_id.clone();
                 motion_top.connect_leave(move |_| {
-                    if let Some(id) = hide_id.take() {
-                        id.remove();
-                    }
-                    let topc = top.clone();
-                    let bottomc = bottom.clone();
-                    let hide_id2 = hide_id.clone();
-                    let sid = glib::timeout_add_local(
-                        Duration::from_millis(FADE_DELAY_MS as u64),
-                        move || {
-                            topc.set_opacity(0.0);
-                            bottomc.set_opacity(0.0);
-                            hide_id2.set(None);
-                            glib::ControlFlow::Break
-                        },
-                    );
-                    hide_id.set(Some(sid));
+                    arm_hide(&top, &bottom, &hide_id, FADE_DELAY_MS);
                 });
             }
             top_handle.add_controller(motion_top);
@@ -637,9 +543,7 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
                 let bottom = bottom.clone();
                 let hide_id = hide_id.clone();
                 motion_bottom.connect_enter(move |_, _, _| {
-                    if let Some(id) = hide_id.take() {
-                        id.remove();
-                    }
+                    cancel_hide(&hide_id);
                     bottom.set_opacity(1.0);
                 });
             }
@@ -654,22 +558,7 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
                 let top = top_handle.clone();
                 let hide_id = hide_id.clone();
                 motion_bottom.connect_leave(move |_| {
-                    if let Some(id) = hide_id.take() {
-                        id.remove();
-                    }
-                    let topc = top.clone();
-                    let bottomc = bottom.clone();
-                    let hide_id2 = hide_id.clone();
-                    let sid = glib::timeout_add_local(
-                        Duration::from_millis(FADE_DELAY_MS as u64),
-                        move || {
-                            topc.set_opacity(0.0);
-                            bottomc.set_opacity(0.0);
-                            hide_id2.set(None);
-                            glib::ControlFlow::Break
-                        },
-                    );
-                    hide_id.set(Some(sid));
+                    arm_hide(&top, &bottom, &hide_id, FADE_DELAY_MS);
                 });
             }
             bottom_outer.add_controller(motion_bottom);
@@ -708,14 +597,8 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
                     return false;
                 }
                 // Load all media from the parent directory of the first dropped file
-                let read_dir = paths[0].parent().unwrap_or(Path::new("."));
-                let mut files: Vec<PathBuf> = std::fs::read_dir(read_dir)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|e| e.ok())
-                    .map(|e| e.path())
-                    .filter(|p| p.is_file() && is_media(p))
-                    .collect();
+                let read_dir = paths[0].parent().unwrap_or(Path::new(".")).to_path_buf();
+                let mut files = state::collect_media(&read_dir);
                 // If directory listing failed (e.g. sandbox), fall back to dropped files only
                 if files.is_empty() {
                     files = paths.iter().filter(|p| is_media(p)).cloned().collect();
@@ -723,7 +606,6 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
                 if files.is_empty() {
                     return false;
                 }
-                files.sort();
                 let start_index = files.iter().position(|f| f == &paths[0]).unwrap_or(0);
                 {
                     let mut s = state.borrow_mut();
@@ -763,13 +645,6 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
         });
     }
     window.add_action(&about_action);
-
-    let quit_action = gio::SimpleAction::new("quit", None);
-    {
-        let app_clone = app.clone();
-        quit_action.connect_activate(move |_, _| app_clone.quit());
-    }
-    window.add_action(&quit_action);
 
     let close_action = gio::SimpleAction::new("close", None);
     {
@@ -814,14 +689,8 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
             dialog.open(Some(&window_clone), None::<&gio::Cancellable>, move |res| {
                 if let Ok(file) = res {
                     if let Some(path) = file.path() {
-                        let read_dir = path.parent().unwrap_or(Path::new("."));
-                        let mut files: Vec<PathBuf> = std::fs::read_dir(read_dir)
-                            .into_iter()
-                            .flatten()
-                            .filter_map(|e| e.ok())
-                            .map(|e| e.path())
-                            .filter(|p| p.is_file() && is_media(p))
-                            .collect();
+                        let read_dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+                        let mut files = state::collect_media(&read_dir);
                         if files.is_empty() {
                             files = vec![path.clone()];
                             if !is_media(&path) {
@@ -832,7 +701,6 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
                                 return;
                             }
                         }
-                        files.sort();
                         let start_index = files.iter().position(|f| f == &path).unwrap_or(0);
                         {
                             let mut s = state.borrow_mut();
@@ -854,6 +722,51 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
     }
     window.add_action(&open_action);
 
+    // Open folder via portal (GtkFileDialog select_folder). Unlike picking a
+    // single file, the portal exports the whole directory, so sibling
+    // navigation works even inside the Flatpak sandbox.
+    let open_folder_action = gio::SimpleAction::new("open-folder", None);
+    {
+        let state = state.clone();
+        let picture = picture.clone();
+        let scrolled = scrolled.clone();
+        let window_clone = window.clone();
+        open_folder_action.connect_activate(move |_, _| {
+            let dialog = gtk::FileDialog::builder()
+                .title("Open Folder")
+                .modal(true)
+                .build();
+            let state = state.clone();
+            let picture = picture.clone();
+            let scrolled = scrolled.clone();
+            let window = window_clone.clone();
+            dialog.select_folder(Some(&window_clone), None::<&gio::Cancellable>, move |res| {
+                if let Ok(file) = res {
+                    if let Some(dir) = file.path() {
+                        let files = state::collect_media(&dir);
+                        if files.is_empty() {
+                            show_toast(&state, "No images or videos in this folder");
+                            return;
+                        }
+                        {
+                            let mut s = state.borrow_mut();
+                            s.files = files;
+                            s.index = 0;
+                            s.zoom = 1.0;
+                        }
+                        reset_scroll(&scrolled);
+                        if let Some(ref st) = state.borrow().empty_status.clone() {
+                            st.set_visible(false);
+                        }
+                        scrolled.set_visible(true);
+                        show_file(&state, &picture, &scrolled, &window);
+                    }
+                }
+            });
+        });
+    }
+    window.add_action(&open_folder_action);
+
     // Shortcuts dialog — HIG §Keyboard
     let shortcuts_action = gio::SimpleAction::new("shortcuts", None);
     {
@@ -863,7 +776,7 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
             // Using AlertDialog keeps compatibility with libadwaita 1.5 bindings
             let dlg = adw::AlertDialog::builder()
                 .heading("Keyboard Shortcuts")
-                .body("Navigation:\n  ← / →, Page Up / Down  —  Previous / Next\n  Home / End  —  First / Last\n  3-finger swipe  —  Previous / Next\n\nZoom:\n  Ctrl + + / −  —  Zoom In / Out\n  Ctrl + 0  —  Reset Zoom\n  Ctrl + Scroll  —  Zoom\n  Pinch  —  Zoom\n  Double-click  —  Toggle 2.5×\n  Drag  —  Pan when zoomed\n\nView:\n  F11 / F  —  Fullscreen\n  Esc  —  Reset Zoom\n\nVideo:\n  Space / K  —  Play / Pause\n  M  —  Mute\n  [ / ]  —  Seek 5 s\n  Click seek bar  —  Seek\n\nApplication:\n  Ctrl + O  —  Open File\n  Ctrl + Q  —  Quit\n  Ctrl + W  —  Close\n  Ctrl + ? / Ctrl + K  —  This Help\n  F1  —  About")
+                .body("Navigation:\n  ← / →, Page Up / Down  —  Previous / Next\n  Home / End  —  First / Last\n  3-finger swipe  —  Previous / Next\n\nZoom:\n  Ctrl + + / −  —  Zoom In / Out\n  Ctrl + 0  —  Reset Zoom\n  Ctrl + Scroll  —  Zoom\n  Pinch  —  Zoom\n  Double-click  —  Toggle 2.5×\n  Drag  —  Pan when zoomed\n\nView:\n  F11 / F  —  Fullscreen\n  Esc  —  Reset Zoom\n\nVideo:\n  Space / K  —  Play / Pause\n  M  —  Mute\n  [ / ]  —  Seek 5 s\n  Click seek bar  —  Seek\n\nFile:\n  Del  —  Move to Trash\n\nApplication:\n  Ctrl + O  —  Open File\n  Ctrl + Shift + O  —  Open Folder\n  Ctrl + Q  —  Quit\n  Ctrl + W  —  Close\n  Ctrl + ? / Ctrl + K  —  This Help\n  F1  —  About")
                 .build();
             dlg.add_response("close", "Close");
             dlg.set_close_response("close");
@@ -899,21 +812,22 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
         window.add_action(&zoom_reset);
     }
 
-    // Accelerators (HIG discoverability)
-    app.set_accels_for_action("win.open", &["<Control>o"]);
-    app.set_accels_for_action(
-        "win.shortcuts",
-        &["<Control>question", "<Control>slash", "<Control>k"],
-    );
-    app.set_accels_for_action("win.about", &["F1"]);
-    app.set_accels_for_action("app.quit", &["<Control>q"]);
-    app.set_accels_for_action("win.close", &["<Control>w"]);
-    app.set_accels_for_action(
-        "win.zoom-in",
-        &["<Control>plus", "<Control>equal", "<Control>KP_Add"],
-    );
-    app.set_accels_for_action("win.zoom-out", &["<Control>minus", "<Control>KP_Subtract"]);
-    app.set_accels_for_action("win.zoom-reset", &["<Control>0", "<Control>KP_0"]);
+    // Move current file to Trash (Del). Index is kept so the next sibling
+    // slides into place instead of resetting to the first item.
+    {
+        let state = state.clone();
+        let picture = picture.clone();
+        let scrolled = scrolled.clone();
+        let window_c = window.clone();
+        let trash = gio::SimpleAction::new("trash", None);
+        trash.connect_activate(move |_, _| {
+            trash_current(&state, &picture, &scrolled, &window_c);
+        });
+        window.add_action(&trash);
+    }
+
+    // Accelerators are registered once in main::connect_startup (single-instance
+    // safe); window actions here are discoverable via those accels.
 
     let has_files = !state.borrow().files.is_empty();
     scrolled.set_visible(has_files);
@@ -1000,17 +914,6 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
                     glib::Propagation::Proceed
                 }
             }
-            // Quit: Ctrl+Q
-            gdk::Key::q if modifier.contains(gtk::gdk::ModifierType::CONTROL_MASK) => {
-                let app = window.application().expect("Window has no application");
-                app.quit();
-                glib::Propagation::Stop
-            }
-            // Close: Ctrl+W
-            gdk::Key::w if modifier.contains(gtk::gdk::ModifierType::CONTROL_MASK) => {
-                window.close();
-                glib::Propagation::Stop
-            }
             // Help: F1
             gdk::Key::F1 => {
                 // Trigger the about action
@@ -1024,87 +927,34 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
                 gio::prelude::ActionGroupExt::activate_action(&window, "shortcuts", None);
                 glib::Propagation::Stop
             }
-            // Play/Pause: Space / K (YouTube/Showtime/Loupe HIG)
+            // Play/Pause: Space / K — only consume when video, so Space still
+            // activates focused buttons on images.
             gdk::Key::space => {
-                let s = state.borrow();
-                if let Some(ref media) = s.media_file {
-                    if s.is_video {
-                        let is_playing = media.is_playing();
-                        let btn = s.play_pause_btn.clone();
-                        let media_clone = media.clone();
-                        drop(s);
-                        if is_playing {
-                            media_clone.pause();
-                            if let Some(btn) = btn {
-                                btn.set_icon_name("media-playback-start-symbolic");
-                                btn.set_tooltip_text(Some("Play (Space)"));
-                            }
-                        } else {
-                            media_clone.play();
-                            if let Some(btn) = btn {
-                                btn.set_icon_name("media-playback-pause-symbolic");
-                                btn.set_tooltip_text(Some("Pause (Space)"));
-                            }
-                        }
-                    }
+                if state.borrow().is_video && state.borrow().media_file.is_some() {
+                    toggle_play_pause(&state);
+                    glib::Propagation::Stop
+                } else {
+                    glib::Propagation::Proceed
                 }
-                glib::Propagation::Stop
             }
             gdk::Key::k => {
-                let s = state.borrow();
-                if let Some(ref media) = s.media_file {
-                    if s.is_video {
-                        let is_playing = media.is_playing();
-                        let btn = s.play_pause_btn.clone();
-                        let media_clone = media.clone();
-                        drop(s);
-                        if is_playing {
-                            media_clone.pause();
-                            if let Some(btn) = btn {
-                                btn.set_icon_name("media-playback-start-symbolic");
-                                btn.set_tooltip_text(Some("Play (K)"));
-                            }
-                        } else {
-                            media_clone.play();
-                            if let Some(btn) = btn {
-                                btn.set_icon_name("media-playback-pause-symbolic");
-                                btn.set_tooltip_text(Some("Pause (K)"));
-                            }
-                        }
-                    }
+                if state.borrow().is_video && state.borrow().media_file.is_some() {
+                    toggle_play_pause(&state);
+                    glib::Propagation::Stop
+                } else {
+                    glib::Propagation::Proceed
                 }
-                glib::Propagation::Stop
             }
-            // Mute toggle: m (HIG) — Space no longer mutes
+            // Mute toggle: m — only consume when video.
             gdk::Key::m => {
-                let (new_muted, media, btn, scale) = {
-                    let s = state.borrow();
-                    let media = s.media_file.clone();
-                    let btn = s.mute_btn.clone();
-                    let scale = s.volume_scale.clone();
-                    if let Some(ref media) = media {
-                        let new_muted = !media.is_muted();
-                        (new_muted, Some(media.clone()), btn, scale)
-                    } else {
+                let new_muted = state.borrow().media_file.as_ref().map(|m| !m.is_muted());
+                if let Some(new_muted) = new_muted {
+                    if state.borrow().is_video {
+                        set_muted_state(&state, new_muted);
                         return glib::Propagation::Stop;
                     }
-                };
-                if let Some(ref media) = media {
-                    media.set_muted(new_muted);
                 }
-                if let Some(ref btn) = btn {
-                    update_mute_button(btn, new_muted);
-                }
-                state.borrow_mut().skip_volume_update = true;
-                if let Some(ref scale) = scale {
-                    if new_muted {
-                        scale.set_value(0.0);
-                    } else if let Some(ref media) = media {
-                        scale.set_value(media.volume());
-                    }
-                }
-                state.borrow_mut().skip_volume_update = false;
-                glib::Propagation::Stop
+                glib::Propagation::Proceed
             }
             // Video seeking: [ (backward 5s) / ] (forward 5s)
             gdk::Key::bracketleft => {
@@ -1130,18 +980,7 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
                 }
                 glib::Propagation::Stop
             }
-            // Open file: Ctrl+O (portal)
-            gdk::Key::o if modifier.contains(gdk::ModifierType::CONTROL_MASK) => {
-                gio::prelude::ActionGroupExt::activate_action(&window, "open", None);
-                glib::Propagation::Stop
-            }
-            // Shortcuts help: Ctrl+? / Ctrl+/ (HIG)
-            gdk::Key::question | gdk::Key::slash
-                if modifier.contains(gdk::ModifierType::CONTROL_MASK) =>
-            {
-                gio::prelude::ActionGroupExt::activate_action(&window, "shortcuts", None);
-                glib::Propagation::Stop
-            }
+            // Ctrl+O / Ctrl+? handled via app accels (win.open / win.shortcuts).
             _ => glib::Propagation::Proceed,
         });
     }
@@ -1171,7 +1010,7 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
         scroll_ctrl.connect_scroll(move |_, dx, dy| {
             let has_content = {
                 let s = state.borrow();
-                s.original_pixbuf.is_some() || s.media_file.is_some()
+                (s.image_w > 0 && s.image_h > 0) || s.media_file.is_some()
             };
             if !has_content {
                 return glib::Propagation::Proceed;
@@ -1364,7 +1203,10 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
         });
     }
 
-    // ── Resize handling: refit media to available viewport on any window/viewport change ──
+    // ── Resize handling: viewport notifies cover drag/tile/maximize/fullscreen
+    // (all change allocation). Window width/height is a fallback for cases
+    // where the viewport size is not yet allocated. Previously 8 notifies
+    // stormed update_display; now 4 coalesced via schedule_update.
     {
         let state = state.clone();
         let picture = picture.clone();
@@ -1379,39 +1221,6 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
         let scrolled_w = scrolled.clone();
         scrolled.connect_notify_local(Some("height"), move |_, _| {
             notify_resize(&state, &picture, &scrolled_w);
-        });
-    }
-    // Window size changes (drag, tiled, maximized, fullscreen) also refit.
-    {
-        let state = state.clone();
-        let picture = picture.clone();
-        let scrolled_w = scrolled.clone();
-        window.connect_notify_local(Some("maximized"), move |_, _| {
-            schedule_update(&state, &picture, &scrolled_w);
-        });
-    }
-    {
-        let state = state.clone();
-        let picture = picture.clone();
-        let scrolled_w = scrolled.clone();
-        window.connect_notify_local(Some("fullscreened"), move |_, _| {
-            schedule_update(&state, &picture, &scrolled_w);
-        });
-    }
-    {
-        let state = state.clone();
-        let picture = picture.clone();
-        let scrolled_w = scrolled.clone();
-        window.connect_notify_local(Some("default-width"), move |_, _| {
-            schedule_update(&state, &picture, &scrolled_w);
-        });
-    }
-    {
-        let state = state.clone();
-        let picture = picture.clone();
-        let scrolled_w = scrolled.clone();
-        window.connect_notify_local(Some("default-height"), move |_, _| {
-            schedule_update(&state, &picture, &scrolled_w);
         });
     }
     // GTK Widget width/height also tracks allocation – handle for drag-resize.
@@ -1445,6 +1254,154 @@ fn update_mute_button(btn: &gtk::Button, muted: bool) {
         btn.set_icon_name("audio-volume-high-symbolic");
         btn.set_tooltip_text(Some("Mute"));
     }
+}
+
+/// Single place for play/pause icon state.
+fn sync_play_button(btn: &gtk::Button, playing: bool) {
+    if playing {
+        btn.set_icon_name("media-playback-pause-symbolic");
+        btn.set_tooltip_text(Some("Pause (Space)"));
+    } else {
+        btn.set_icon_name("media-playback-start-symbolic");
+        btn.set_tooltip_text(Some("Play (Space)"));
+    }
+}
+
+fn toggle_play_pause(state: &Rc<RefCell<AppState>>) {
+    let (media, btn) = {
+        let s = state.borrow();
+        (s.media_file.clone(), s.play_pause_btn.clone())
+    };
+    if let (Some(media), Some(btn)) = (media, btn) {
+        if state.borrow().is_video {
+            if media.is_playing() {
+                media.pause();
+                sync_play_button(&btn, false);
+            } else {
+                media.play();
+                sync_play_button(&btn, true);
+            }
+        }
+    }
+}
+
+/// Single place for mute + volume-slider sync (avoids the three divergent copies).
+fn set_muted_state(state: &Rc<RefCell<AppState>>, muted: bool) {
+    let (media, btn, scale) = {
+        let s = state.borrow();
+        (
+            s.media_file.clone(),
+            s.mute_btn.clone(),
+            s.volume_scale.clone(),
+        )
+    };
+    if let Some(ref media) = media {
+        media.set_muted(muted);
+    }
+    if let Some(btn) = btn {
+        update_mute_button(&btn, muted);
+    }
+    state.borrow_mut().skip_volume_update = true;
+    if let Some(scale) = scale {
+        if muted {
+            scale.set_value(0.0);
+        } else if let Some(ref media) = media {
+            scale.set_value(media.volume());
+        }
+    }
+    state.borrow_mut().skip_volume_update = false;
+}
+
+/// Refresh seek bar + time labels + play icon from the current media position.
+/// Called from timestamp/duration/playing notifies (signal-driven, no polling).
+fn update_seek_ui(state: &Rc<RefCell<AppState>>) {
+    let (media, seeking, scale, pos, dur, play_btn, is_vid) = {
+        let s = state.borrow();
+        (
+            s.media_file.clone(),
+            s.seeking,
+            s.seek_scale.clone(),
+            s.position_label.clone(),
+            s.duration_label.clone(),
+            s.play_pause_btn.clone(),
+            s.is_video,
+        )
+    };
+    let Some(media) = media else { return };
+    if !is_vid {
+        return;
+    }
+    let ts = media.timestamp();
+    let dur_val = media.duration();
+    if !seeking {
+        if let Some(scale) = scale {
+            if dur_val > 0 {
+                scale.set_value((ts as f64 / dur_val as f64) * 500.0);
+            }
+        }
+    }
+    if let Some(label) = pos {
+        label.set_text(&format_time(ts));
+    }
+    if let Some(label) = dur {
+        if dur_val > 0 {
+            label.set_text(&format_time(dur_val));
+        }
+    }
+    if let Some(btn) = play_btn {
+        sync_play_button(&btn, media.is_playing());
+    }
+}
+
+fn show_toast(state: &Rc<RefCell<AppState>>, msg: &str) {
+    if let Some(overlay) = state.borrow().toast_overlay.clone() {
+        let toast = adw::Toast::new(msg);
+        toast.set_timeout(3);
+        overlay.add_toast(toast);
+    }
+}
+
+/// True when `path` lives under the Flatpak document portal
+/// (`$XDG_RUNTIME_DIR/doc/…`). The portal exports only the explicitly
+/// opened file, so the containing directory always lists a single item
+/// and sibling navigation is impossible from such paths.
+fn is_doc_portal_path(path: &Path) -> bool {
+    let doc_dir = std::env::var("XDG_RUNTIME_DIR")
+        .map(|r| PathBuf::from(r).join("doc"))
+        .unwrap_or_else(|_| PathBuf::from("/run/user/1000/doc"));
+    path.starts_with(&doc_dir)
+}
+
+fn reset_scroll(scrolled: &gtk::ScrolledWindow) {
+    scrolled.hadjustment().set_value(0.0);
+    scrolled.vadjustment().set_value(0.0);
+}
+
+// ── Auto-hide helpers (opacity-only; CSS transparencies untouched) ──
+fn cancel_hide(hide_id: &Rc<Cell<Option<glib::SourceId>>>) {
+    if let Some(id) = hide_id.take() {
+        id.remove();
+    }
+}
+
+fn arm_hide(
+    top: &gtk::WindowHandle,
+    bottom: &gtk::Box,
+    hide_id: &Rc<Cell<Option<glib::SourceId>>>,
+    delay_ms: u32,
+) {
+    cancel_hide(hide_id);
+    let topc = top.clone();
+    let bottomc = bottom.clone();
+    let hide_id2 = hide_id.clone();
+    let sid = glib::timeout_add_local(Duration::from_millis(delay_ms as u64), move || {
+        // Opacity-only fade; widgets stay in place so overlay layout/push is unchanged.
+        topc.set_opacity(0.0);
+        bottomc.set_opacity(0.0);
+        hide_id2.set(None);
+        glib::ControlFlow::Break
+    });
+    hide_id.set(Some(sid));
 }
 
 fn schedule_update(
@@ -1498,13 +1455,15 @@ fn zoom_to(
     let new_zoom = state::clamp_zoom(new_zoom);
     let (old_zoom, intrinsic, viewport) = {
         let s = state.borrow();
-        if s.original_pixbuf.is_none() && s.media_file.is_none() {
+        let has_image = s.image_w > 0 && s.image_h > 0;
+        if !has_image && s.media_file.is_none() {
             return;
         }
-        let iw = s
-            .original_pixbuf
-            .as_ref()
-            .map(|pb| (pb.width().max(1) as f64, pb.height().max(1) as f64));
+        let iw = if has_image {
+            Some((s.image_w as f64, s.image_h as f64))
+        } else {
+            None
+        };
         let vid = if s.is_video {
             if s.video_w > 0 && s.video_h > 0 {
                 Some((s.video_w as f64, s.video_h as f64))
@@ -1546,19 +1505,34 @@ fn zoom_to(
     state.borrow_mut().zoom = new_zoom;
     schedule_update(state, picture, scrolled);
 
+    // Re-anchor scroll after layout: idle first (runs after update_display's
+    // idle), with a single 10ms retry if adjustments aren't allocated yet.
+    // Replaces the previous blind 10ms timeout race.
     let scrolled_c = scrolled.clone();
-    glib::timeout_add_local_once(Duration::from_millis(10), move || {
-        let hadj = scrolled_c.hadjustment();
-        let vadj = scrolled_c.vadjustment();
-        let new_hv = (old_hv + ax) * ratio_x - ax;
-        let new_vv = (old_vv + ay) * ratio_y - ay;
-        let h_max = (new_dw as f64 - vw).max(0.0);
-        let v_max = (new_dh as f64 - vh).max(0.0);
-        if h_max > 0.0 {
-            hadj.set_value(new_hv.clamp(0.0, h_max));
-        }
-        if v_max > 0.0 {
-            vadj.set_value(new_vv.clamp(0.0, v_max));
+    glib::idle_add_local_once(move || {
+        // If layout hasn't run yet (upper bound still 0), retry once shortly.
+        let need_retry = scrolled_c.hadjustment().upper() <= 1.0
+            && scrolled_c.vadjustment().upper() <= 1.0
+            && (new_dw as f64 > vw || new_dh as f64 > vh);
+        let scrolled_a = scrolled_c.clone();
+        let apply = move || {
+            let hadj = scrolled_a.hadjustment();
+            let vadj = scrolled_a.vadjustment();
+            let new_hv = (old_hv + ax) * ratio_x - ax;
+            let new_vv = (old_vv + ay) * ratio_y - ay;
+            let h_max = (new_dw as f64 - vw).max(0.0);
+            let v_max = (new_dh as f64 - vh).max(0.0);
+            if h_max > 0.0 {
+                hadj.set_value(new_hv.clamp(0.0, h_max));
+            }
+            if v_max > 0.0 {
+                vadj.set_value(new_vv.clamp(0.0, v_max));
+            }
+        };
+        if need_retry {
+            glib::timeout_add_local_once(Duration::from_millis(10), apply);
+        } else {
+            apply();
         }
     });
 }
@@ -1587,6 +1561,64 @@ fn nav(
     scrolled.hadjustment().set_value(0.0);
     scrolled.vadjustment().set_value(0.0);
     show_file(state, picture, scrolled, window);
+}
+
+/// Move the current file to Trash and advance to the next sibling.
+///
+/// The index is NOT reset: after removal the next file slides into the
+/// same index (or the previous one if the last item was trashed).
+fn trash_current(
+    state: &Rc<RefCell<AppState>>,
+    picture: &gtk::Picture,
+    scrolled: &gtk::ScrolledWindow,
+    window: &adw::ApplicationWindow,
+) {
+    let path = {
+        let s = state.borrow();
+        if s.files.is_empty() {
+            return;
+        }
+        s.files[s.index].clone()
+    };
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file")
+        .to_string();
+
+    // GIO trash (goes to Trash, not permanent delete). Needs write access
+    // to the containing directory (Flatpak: --filesystem=host:rw).
+    let file = gio::File::for_path(&path);
+    if let Err(e) = file.trash(None::<&gio::Cancellable>) {
+        debug_log(&format!("trash failed for {}: {e}", path.display()));
+        if is_doc_portal_path(&path) {
+            show_toast(
+                state,
+                "Cannot move to Trash from sandbox portal — use the Files app",
+            );
+        } else {
+            show_toast(state, &format!("Cannot move {name} to Trash"));
+        }
+        return;
+    }
+
+    // (Two statements: the position lookup must finish before the mutable
+    // borrow below, else RefCell panics.)
+    let pos = state.borrow().files.iter().position(|f| f == &path);
+    {
+        let mut s = state.borrow_mut();
+        if let Some(pos) = pos {
+            s.files.remove(pos);
+            s.prefetch.remove(&path);
+            s.index = state::index_after_removal(s.files.len(), s.index, pos);
+            s.zoom = 1.0;
+        }
+    }
+    reset_scroll(scrolled);
+    show_file(state, picture, scrolled, window);
+    if !state.borrow().files.is_empty() {
+        show_toast(state, &format!("Moved {name} to Trash"));
+    }
 }
 
 fn show_file(
@@ -1631,6 +1663,15 @@ fn show_file(
         wt.set_subtitle(&format!("{} of {}", idx + 1, total));
     }
 
+    // Single file via the sandbox document portal: siblings are not visible
+    // by design, so explain how to browse the whole folder instead.
+    if total == 1 && is_doc_portal_path(&path) {
+        show_toast(
+            state,
+            "Single file from sandbox portal — use Open Folder to browse all",
+        );
+    }
+
     if state::has_ext(&path, state::VIDEO_EXTS) {
         show_video(state, picture, scrolled, &path);
     } else {
@@ -1644,48 +1685,172 @@ fn show_image(
     scrolled: &gtk::ScrolledWindow,
     path: &Path,
 ) {
-    let mut s = state.borrow_mut();
-    if let Some(ref old) = s.media_file {
-        old.pause();
+    {
+        let mut s = state.borrow_mut();
+        if let Some(ref old) = s.media_file {
+            old.pause();
+        }
+        s.video_gen = s.video_gen.wrapping_add(1);
+        s.media_file = None;
+        s.zoom = 1.0;
+        s.is_video = false;
+        s.image_gen = s.image_gen.wrapping_add(1);
+        s.image_w = 0;
+        s.image_h = 0;
+        s.original_pixbuf = None;
     }
-    s.video_gen = s.video_gen.wrapping_add(1);
-    s.media_file = None;
-    s.zoom = 1.0;
-    s.is_video = false;
 
-    if let Some(ref h) = s.bottom_bar {
+    if let Some(ref h) = state.borrow().bottom_bar {
         h.set_visible(false);
     }
 
-    match gdk_pixbuf::Pixbuf::from_file(path) {
-        Ok(pixbuf) => {
-            let orientation = media::read_exif_orientation(path);
-            let pixbuf = media::apply_orientation(&pixbuf, orientation);
-            let tex = media::texture_for_pixbuf(&pixbuf);
-            s.original_pixbuf = Some(pixbuf);
-            drop(s);
-            scrolled.set_child(Some(picture));
-            picture.set_paintable(Some(&tex));
-            picture.set_content_fit(gtk::ContentFit::Contain);
-            scrolled.hadjustment().set_value(0.0);
-            scrolled.vadjustment().set_value(0.0);
-            schedule_update(state, picture, scrolled);
-        }
-        Err(e) => {
-            debug_log(&format!("Failed to load: {}", e));
-            s.original_pixbuf = None;
-            let none: Option<&gdk::Texture> = None;
-            picture.set_paintable(none);
-            // Show toast on error (GNOME HIG feedback pattern)
-            if let Some(ref overlay) = s.toast_overlay {
-                let toast = adw::Toast::new(&format!(
-                    "Failed to load {}",
-                    path.file_name().unwrap_or_default().to_string_lossy()
-                ));
-                toast.set_timeout(3);
-                overlay.add_toast(toast);
+    let path_buf = path.to_path_buf();
+    let gen = state.borrow().image_gen;
+
+    // Fast path: prefetched neighbor already decoded.
+    // (Two statements: the RefMut from the remove must drop before the
+    // body borrows state again, else RefCell panics.)
+    let cached = state.borrow_mut().prefetch.remove(&path_buf);
+    if let Some(cached) = cached {
+        let w = cached.width().max(1);
+        let h = cached.height().max(1);
+        let tex = media::texture_for_pixbuf(&cached);
+        {
+            let mut s = state.borrow_mut();
+            if s.image_gen != gen {
+                return;
             }
+            s.image_w = w;
+            s.image_h = h;
+            // Drop CPU pixels after GPU upload; dimensions retained for zoom.
+            s.original_pixbuf = None;
         }
+        scrolled.set_child(Some(picture));
+        picture.set_paintable(Some(&tex));
+        picture.set_content_fit(gtk::ContentFit::Contain);
+        reset_scroll(scrolled);
+        schedule_update(state, picture, scrolled);
+        prefetch_neighbors(state);
+        return;
+    }
+
+    // Async decode via GIO (never blocks the UI thread on large files).
+    // Stale results are discarded via image_gen. EXIF read is a tiny header
+    // parse kept synchronous after decode.
+    let state_c = state.clone();
+    let picture_c = picture.clone();
+    let scrolled_c = scrolled.clone();
+    let path_c = path_buf.clone();
+    let file = gio::File::for_path(&path_buf);
+    file.read_async(
+        glib::Priority::DEFAULT,
+        None::<&gio::Cancellable>,
+        move |res| {
+            let Ok(stream) = res else {
+                if state_c.borrow().image_gen != gen {
+                    return;
+                }
+                picture_c.set_paintable(None::<&gdk::Texture>);
+                show_toast(
+                    &state_c,
+                    &format!(
+                        "Failed to load {}",
+                        path_c.file_name().unwrap_or_default().to_string_lossy()
+                    ),
+                );
+                return;
+            };
+            let state_c2 = state_c.clone();
+            let picture_c2 = picture_c.clone();
+            let scrolled_c2 = scrolled_c.clone();
+            gdk_pixbuf::Pixbuf::from_stream_async(&stream, None::<&gio::Cancellable>, move |res| {
+                if state_c2.borrow().image_gen != gen {
+                    return;
+                }
+                match res {
+                    Ok(raw) => {
+                        let orientation = media::read_exif_orientation(&path_c);
+                        let pixbuf = media::apply_orientation(&raw, orientation);
+                        let w = pixbuf.width().max(1);
+                        let h = pixbuf.height().max(1);
+                        let tex = media::texture_for_pixbuf(&pixbuf);
+                        {
+                            let mut s = state_c2.borrow_mut();
+                            s.image_w = w;
+                            s.image_h = h;
+                            s.original_pixbuf = None;
+                        }
+                        scrolled_c2.set_child(Some(&picture_c2));
+                        picture_c2.set_paintable(Some(&tex));
+                        picture_c2.set_content_fit(gtk::ContentFit::Contain);
+                        reset_scroll(&scrolled_c2);
+                        schedule_update(&state_c2, &picture_c2, &scrolled_c2);
+                        prefetch_neighbors(&state_c2);
+                    }
+                    Err(e) => {
+                        debug_log(&format!("Failed to load: {}", e));
+                        picture_c2.set_paintable(None::<&gdk::Texture>);
+                        show_toast(
+                            &state_c2,
+                            &format!(
+                                "Failed to load {}",
+                                path_c.file_name().unwrap_or_default().to_string_lossy()
+                            ),
+                        );
+                    }
+                }
+            });
+        },
+    );
+}
+
+/// Decode next/prev images in the background so navigation feels instant.
+/// Bounded to 2 entries; GIO-async so the UI never blocks.
+fn prefetch_neighbors(state: &Rc<RefCell<AppState>>) {
+    let (files, index) = {
+        let s = state.borrow();
+        (s.files.clone(), s.index)
+    };
+    if files.is_empty() {
+        return;
+    }
+    let mut targets = Vec::new();
+    if index + 1 < files.len() {
+        targets.push(files[index + 1].clone());
+    }
+    if index > 0 {
+        targets.push(files[index - 1].clone());
+    }
+    for target in targets {
+        if !state::has_ext(&target, state::IMAGE_EXTS) {
+            continue;
+        }
+        if state.borrow().prefetch.contains_key(&target) {
+            continue;
+        }
+        let state_c = state.clone();
+        let file = gio::File::for_path(&target);
+        file.read_async(glib::Priority::LOW, None::<&gio::Cancellable>, move |res| {
+            let Ok(stream) = res else { return };
+            let state_c2 = state_c.clone();
+            gdk_pixbuf::Pixbuf::from_stream_async(&stream, None::<&gio::Cancellable>, move |res| {
+                let Ok(raw) = res else { return };
+                let orientation = media::read_exif_orientation(&target);
+                let pixbuf = media::apply_orientation(&raw, orientation);
+                let mut s = state_c2.borrow_mut();
+                if s.prefetch.contains_key(&target) {
+                    return;
+                }
+                while s.prefetch.len() >= 2 {
+                    if let Some(k) = s.prefetch.keys().next().cloned() {
+                        s.prefetch.remove(&k);
+                    } else {
+                        break;
+                    }
+                }
+                s.prefetch.insert(target, pixbuf);
+            });
+        });
     }
 }
 
@@ -1750,7 +1915,8 @@ fn update_display(
         is_video,
         s.video_w,
         s.video_h,
-        &s.original_pixbuf,
+        s.image_w,
+        s.image_h,
         &s.media_file,
     ) else {
         debug_log(&format!(
@@ -1779,31 +1945,18 @@ fn update_display(
     ));
     if is_video {
         let zp = state.borrow().video_view.clone();
-        if let Some(ref zp) = zp {
-            let (fw, fh) = zoom::fit_size(iw, ih, vw, vh);
-            zp.set_view(fw, fh, zoom);
-        }
+        let (fw, fh) = zoom::fit_size(iw, ih, vw, vh);
+        zp.set_view(fw, fh, zoom);
         picture.set_content_fit(gtk::ContentFit::Fill);
         picture.set_size_request(dw, dh);
         if picture.paintable().is_none() {
-            if let Some(ref zp) = state.borrow().video_view.clone() {
-                let zp_paintable: gdk::Paintable = zp.clone().upcast();
-                picture.set_paintable(Some(&zp_paintable));
-            }
+            let zp_paintable: gdk::Paintable = zp.clone().upcast();
+            picture.set_paintable(Some(&zp_paintable));
         }
     } else {
         picture.set_content_fit(gtk::ContentFit::Contain);
         picture.set_size_request(dw, dh);
-        if picture.paintable().is_none() {
-            if let Some(tex) = state
-                .borrow()
-                .original_pixbuf
-                .as_ref()
-                .map(media::texture_for_pixbuf)
-            {
-                picture.set_paintable(Some(&tex));
-            }
-        }
+        // Paintable is set at load time; no pixbuf retained (memory: GPU copy only).
     }
 }
 
@@ -1818,13 +1971,17 @@ fn show_video(
         old.pause();
     }
     s.original_pixbuf = None;
+    s.image_w = 0;
+    s.image_h = 0;
+    // Invalidate any in-flight async image load.
+    s.image_gen = s.image_gen.wrapping_add(1);
     s.zoom = 1.0;
     s.is_video = true;
     s.seeking = false;
     s.video_gen = s.video_gen.wrapping_add(1);
     s.video_w = 0;
     s.video_h = 0;
-    let gen = s.video_gen;
+    // gen kept for size-discovery guard below.
 
     // Reset play/pause button
     if let Some(ref btn) = s.play_pause_btn {
@@ -1871,115 +2028,90 @@ fn show_video(
     }
 
     let zp = state.borrow().video_view.clone();
-    if let Some(ref zp) = zp {
-        zp.set_inner(Some(media.clone().upcast()));
-    }
+    zp.set_inner(Some(media.clone().upcast()));
     scrolled.set_child(Some(picture));
     picture.set_content_fit(gtk::ContentFit::Fill);
-    if let Some(ref zp) = zp {
-        let zp_paintable: gdk::Paintable = zp.clone().upcast();
-        picture.set_paintable(Some(&zp_paintable));
-    }
+    let zp_paintable: gdk::Paintable = zp.clone().upcast();
+    picture.set_paintable(Some(&zp_paintable));
     scrolled.hadjustment().set_value(0.0);
     scrolled.vadjustment().set_value(0.0);
     schedule_update(state, picture, scrolled);
 
     // When the video's intrinsic size becomes known, re-fit.
+    // Size discovery disconnects after the first hit (no per-frame work).
     {
-        let state = state.clone();
-        let picture = picture.clone();
-        let scrolled = scrolled.clone();
-        media.connect_invalidate_size({
-            let state = state.clone();
-            let picture = picture.clone();
-            let scrolled = scrolled.clone();
-            move |_| {
-                debug_log("video: invalidate-size");
-                schedule_update(&state, &picture, &scrolled);
-            }
-        });
-        let state2 = state.clone();
-        let picture2 = picture.clone();
-        let scrolled2 = scrolled.clone();
-        let media2 = media.clone();
-        media.connect_invalidate_contents(move |_| {
-            if let Some((w, h)) = zoom::video_intrinsic(&media2) {
+        let state_c = state.clone();
+        let picture_c = picture.clone();
+        let scrolled_c = scrolled.clone();
+        let media_c = media.clone();
+        let size_handler = Rc::new(RefCell::new(None::<glib::SignalHandlerId>));
+        let size_handler_c = size_handler.clone();
+        let id = media.connect_invalidate_size(move |_| {
+            if let Some((w, h)) = zoom::video_intrinsic(&media_c) {
                 let (wi, hi) = (w as i32, h as i32);
-                let stored = {
-                    let s = state2.borrow();
-                    (s.video_w, s.video_h)
-                };
-                if (wi, hi) != stored {
-                    {
-                        let mut s = state2.borrow_mut();
+                let changed = {
+                    let mut s = state_c.borrow_mut();
+                    if (wi, hi) != (s.video_w, s.video_h) {
                         s.video_w = wi;
                         s.video_h = hi;
+                        true
+                    } else {
+                        false
                     }
+                };
+                if changed {
                     debug_log(&format!("video: size discovered {wi}x{hi}"));
-                    schedule_update(&state2, &picture2, &scrolled2);
+                    schedule_update(&state_c, &picture_c, &scrolled_c);
+                    // Size known: stop listening (one-shot).
+                    if let Some(hid) = size_handler_c.borrow_mut().take() {
+                        media_c.disconnect(hid);
+                    }
                 }
+            } else {
+                schedule_update(&state_c, &picture_c, &scrolled_c);
+            }
+        });
+        *size_handler.borrow_mut() = Some(id);
+    }
+
+    // Signal-driven seek UI: timestamp/duration/playing notifies replace the
+    // old 200ms poll (idle even when paused). Seeking flag clears on seek-done.
+    {
+        let state_c = state.clone();
+        media.connect_timestamp_notify(move |_| {
+            update_seek_ui(&state_c);
+        });
+    }
+    {
+        let state_c = state.clone();
+        media.connect_duration_notify(move |_| {
+            update_seek_ui(&state_c);
+        });
+    }
+    {
+        let state_c = state.clone();
+        media.connect_playing_notify(move |_| {
+            update_seek_ui(&state_c);
+        });
+    }
+    {
+        let state_c = state.clone();
+        media.connect_seeking_notify(move |m| {
+            if !m.is_seeking() {
+                state_c.borrow_mut().seeking = false;
+            }
+            update_seek_ui(&state_c);
+        });
+    }
+    // Error feedback (previously silent black frame).
+    {
+        let state_c = state.clone();
+        media.connect_error_notify(move |m| {
+            if let Some(err) = m.error() {
+                debug_log(&format!("video error: {err:?}"));
+                show_toast(&state_c, "Failed to play video (missing codec?)");
             }
         });
     }
-
-    // Seek bar update timer (generation-guarded so old timers die on nav).
-    let state_clone = state.clone();
-    glib::timeout_add_local(Duration::from_millis(200), move || {
-        let (
-            media_opt,
-            seeking,
-            seek_scale_opt,
-            position_label_opt,
-            duration_label_opt,
-            play_pause_btn_opt,
-            video_gen_now,
-            is_vid,
-        ) = {
-            let s = state_clone.borrow();
-            (
-                s.media_file.clone(),
-                s.seeking,
-                s.seek_scale.clone(),
-                s.position_label.clone(),
-                s.duration_label.clone(),
-                s.play_pause_btn.clone(),
-                s.video_gen,
-                s.is_video,
-            )
-        };
-        if video_gen_now != gen || !is_vid {
-            return glib::ControlFlow::Break;
-        }
-        if let Some(media) = media_opt {
-            let ts = media.timestamp();
-            let dur = media.duration();
-            if !seeking {
-                if let Some(ref scale) = seek_scale_opt {
-                    if dur > 0 {
-                        state_clone.borrow_mut().updating_seek_bar = true;
-                        scale.set_value((ts as f64 / dur as f64) * 500.0);
-                        state_clone.borrow_mut().updating_seek_bar = false;
-                    }
-                }
-            }
-            if let Some(ref label) = position_label_opt {
-                label.set_text(&format_time(ts));
-            }
-            if let Some(ref label) = duration_label_opt {
-                if dur > 0 {
-                    label.set_text(&format_time(dur));
-                }
-            }
-            if let Some(ref btn) = play_pause_btn_opt {
-                if media.is_playing() {
-                    btn.set_icon_name("media-playback-pause-symbolic");
-                } else {
-                    btn.set_icon_name("media-playback-start-symbolic");
-                }
-            }
-            glib::ControlFlow::Continue
-        } else {
-            glib::ControlFlow::Break
-        }
-    });
+    update_seek_ui(state);
 }

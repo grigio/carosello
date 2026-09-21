@@ -99,7 +99,7 @@ mod zoom_paintable {
             let imp = self.imp();
             imp.base_w.set(base_w.max(1.0));
             imp.base_h.set(base_h.max(1.0));
-            imp.zoom.set(zoom.clamp(0.05, 50.0));
+            imp.zoom.set(crate::state::clamp_zoom(zoom));
             self.invalidate_size();
         }
     }
@@ -134,7 +134,8 @@ pub fn intrinsic_size(
     is_video: bool,
     video_w: i32,
     video_h: i32,
-    original_pixbuf: &Option<gdk_pixbuf::Pixbuf>,
+    image_w: i32,
+    image_h: i32,
     media_file: &Option<gtk::MediaFile>,
 ) -> Option<(f64, f64)> {
     if is_video {
@@ -146,9 +147,11 @@ pub fn intrinsic_size(
         }
         return None;
     }
-    original_pixbuf
-        .as_ref()
-        .map(|pb| (pb.width().max(1) as f64, pb.height().max(1) as f64))
+    if image_w > 0 && image_h > 0 {
+        Some((image_w as f64, image_h as f64))
+    } else {
+        None
+    }
 }
 
 /// Fit size preserving aspect ratio to fill available viewport.

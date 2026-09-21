@@ -1,0 +1,48 @@
+# AGENTS.md — Carosello
+
+## Flatpak permissions
+
+- GVfs needs **both** entries in `finish-args`, otherwise every `GFile`
+  call logs `GVFS-WARNING ... missing --filesystem=xdg-run/gvfsd privileges`:
+  `--filesystem=xdg-run/gvfs:ro` (mount points) +
+  `--filesystem=xdg-run/gvfsd` (daemon sockets, no `:ro`).
+- `--filesystem=host:rw` lets `read_dir(parent)` list siblings of an
+  opened file. Narrower grants break sibling navigation. Read-write (not
+  `:ro`) is required so Move to Trash (`GFile` trash) can delete.
+- **Document portal limitation** (`$XDG_RUNTIME_DIR/doc/…`): double-clicking
+  a file in Files, or picking a single file via the Open portal, exports
+  **only that file** — its portal parent always lists 1 item, so "1 of 1"
+  is by design, not a listing bug. Workarounds:
+  - "Open Folder…" uses `FileDialog::select_folder`, which exports the
+    whole directory (siblings visible).
+  - Launching with a real path (`flatpak run … ~/Pictures/Dir`) works via
+    `host:rw`.
+  - `is_doc_portal_path()` detects portal paths; `show_file()` toasts a
+    hint instead of failing silently.
+- No new crates / system deps without regenerating `cargo-sources.json`
+  (CI regenerates it from `Cargo.lock`; keep the lockfile committed).
+
+## Panics / RefCell
+
+- Never `if let Some(x) = state.borrow_mut().map.remove(k)` and then
+  borrow `state` again in the body: the `RefMut` temporary lives for the
+  whole `if`, so the inner borrow **panics**. Split into two statements.
+  Same applies to `state.borrow().field` + `ref` bindings in scrutinees.
+- `gdk_pixbuf::Pixbuf` is **not `Send`**: no `std::thread::spawn` with
+  Pixbuf/`Rc<AppState>` captures. Use GIO async (`File::read_async` +
+  `Pixbuf::from_stream_async`) — decode leaves the UI thread, everything
+  stays on the main context.
+- Release profile strips symbols (`strip`, `panic=abort`); to debug a
+  flatpak crash, reproduce with the dev binary + `RUST_BACKTRACE=1`
+  (Wayland is available, headless launch works).
+
+## Verify
+
+- `cargo fmt && cargo clippy --all-targets -- -D warnings && cargo test`
+  (CI runs exactly this; `-D warnings` turns the prefetch-style `dead_code`
+  and `unnecessary_sort_by` lints into failures).
+- Reinstall: `flatpak-builder --user --install --force-clean build-dir
+  io.github.grigio.carosello.yml`
+- Smoke test headless, check stderr is empty (no panic, no GVFS warnings):
+  `timeout 10 flatpak run io.github.grigio.carosello ~/Pictures/Screenshots`
+  plus a portal path under `/run/user/1000/doc/…`.
