@@ -18,13 +18,17 @@ finish-args:
   - --socket=fallback-x11
   - --device=dri
   - --talk-name=org.freedesktop.secrets
-  # Use portals for file access (xdg-pictures/videos) + fallback for drag-and-drop
-  - --filesystem=xdg-pictures:ro
-  - --filesystem=xdg-videos:ro
-  - --filesystem=xdg-download:ro
-  # Thumbnail access
-  - --filesystem=xdg-run/gvfs
-  - --filesystem=xdg-run/gvfsd
+  # Read-only host access so the app can list sibling images/videos
+  # in the containing directory of an opened file, wherever it lives
+  # (Pictures, Downloads, /media, /mnt, project dirs, ...).
+  # A per-directory grant (xdg-pictures/videos/download only) breaks
+  # sibling navigation: the FileChooser portal grants just the single
+  # picked file, and read_dir(parent) fails outside those dirs.
+  - --filesystem=host:ro
+  # Remote/virtual mounts (sftp, smb, ...) via GVfs
+  - --filesystem=xdg-run/gvfs:ro
+  - --talk-name=org.gtk.vfs
+  - --talk-name=org.gtk.vfs.*
 
 modules:
   - name: carosello

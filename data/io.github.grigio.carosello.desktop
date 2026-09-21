@@ -1,7 +1,7 @@
 [Desktop Entry]
 Name=Carosello
 Comment=A fast, minimalist image and video viewer for Linux
-Exec=carosello %u
+Exec=carosello %U
 Icon=io.github.grigio.carosello
 Terminal=false
 Type=Application
