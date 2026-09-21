@@ -3,6 +3,11 @@ use std::path::PathBuf;
 use gtk::gdk;
 use gtk::gio;
 
+// Compile-time fallback so release binaries (cargo build, extra-data
+// packaging) are self-contained: the style is always available even when
+// neither the installed GResource bundle nor a source checkout is present.
+const EMBEDDED_CSS: &str = include_str!("../data/style.css");
+
 pub fn load_css() {
     let provider = gtk::CssProvider::new();
     let resource_path = "/io/github/grigio/carosello/style.css";
@@ -19,7 +24,7 @@ pub fn load_css() {
         }
     }
 
-    // 2. Fall back to data/style.css (cargo dev builds)
+    // 2. Fall back to data/style.css (cargo dev builds, live reload)
     if !loaded {
         if let Ok(cwd) = std::env::current_dir() {
             let css_path = cwd.join("data").join("style.css");
@@ -30,8 +35,10 @@ pub fn load_css() {
         }
     }
 
+    // 3. Embedded copy: guarantees styled UI for binaries run outside a
+    // checkout (e.g. release artifacts, extra-data Flatpak payloads).
     if !loaded {
-        provider.load_from_resource(resource_path);
+        provider.load_from_string(EMBEDDED_CSS);
     }
 
     #[allow(deprecated)]

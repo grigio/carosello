@@ -35,6 +35,11 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="1.0.6" date="2026-09-21">
+      <description>
+        <p>Embed CSS in the binary so release artifacts are styled without an installed GResource bundle.</p>
+      </description>
+    </release>
     <release version="1.0.5" date="2026-09-18">
       <description>
         <p>Fix flatpak: remove DBusActivatable without service file.</p>
