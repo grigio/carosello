@@ -35,6 +35,11 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="1.0.8" date="2026-09-21">
+      <description>
+        <p>Slide animation between items (3-finger drag follows the finger), Preferences switch to disable it, sandboxed drag-and-drop of portal files and folders, and EXIF-orientation fix for transition frames.</p>
+      </description>
+    </release>
     <release version="1.0.7" date="2026-09-21">
       <description>
         <p>Move the current item to Trash with Del, staying on the next item instead of resetting to the first.</p>

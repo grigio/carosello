@@ -47,6 +47,52 @@ struct AppState {
     toast_overlay: Option<adw::ToastOverlay>,
     window_title: Option<adw::WindowTitle>,
     empty_status: Option<adw::StatusPage>,
+    main_overlay: Option<gtk::Overlay>,
+    slide_fixed: Option<gtk::Fixed>,
+    slide_gen: u64,
+    sliding: bool,
+    /// End timestamp (monotonic µs) of the last locked touchpad drag, so
+    /// the discrete swipe signal of the same gesture isn't double-counted.
+    last_drag_us: i64,
+    /// Active interactive touchpad drag (finger down, frames following).
+    drag: Option<DragSt>,
+    /// User pref: cross-slide between items (Preferences… switch).
+    slide_enabled: bool,
+}
+
+/// One interactive 3-finger drag: the outgoing frame plus the incoming
+/// frame (once locked and built) travel with the finger on the stage.
+struct DragSt {
+    stage: gtk::Fixed,
+    old_pic: gtk::Picture,
+    new_pic: Option<gtk::Picture>,
+    obx: f64,
+    oby: f64,
+    nbx: f64,
+    nby: f64,
+    w: i32,
+    h: i32,
+    vw: f64,
+    vh: f64,
+    dir: i32,
+    new_index: usize,
+    /// Raw accumulated finger travel (px, left negative).
+    accum: f64,
+    /// Current clamped stage offset applied to both frames.
+    ox: f64,
+    locked: bool,
+    /// No sibling in the locked direction: drag with resistance, release
+    /// always snaps back.
+    at_edge: bool,
+    /// Incoming frame placed and pre-scaled (images at lock, videos when
+    /// the pipeline reports a size). Without it the drag only tracks the
+    /// outgoing frame and the release cuts instantly.
+    visual: bool,
+    ready: bool,
+    is_video: bool,
+    /// Recent (monotonic µs, accumulated px) samples for fling velocity.
+    samples: Vec<(i64, f64)>,
+    gen: u64,
 }
 
 pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWindow {
@@ -84,6 +130,13 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
         toast_overlay: None,
         window_title: None,
         empty_status: None,
+        main_overlay: None,
+        slide_fixed: None,
+        slide_gen: 0,
+        sliding: false,
+        last_drag_us: 0,
+        drag: None,
+        slide_enabled: state::load_slide_enabled(),
     }));
 
     let mut start_index: usize = 0;
@@ -238,6 +291,7 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
     section.append(Some("Open…"), Some("win.open"));
     section.append(Some("Open Folder…"), Some("win.open-folder"));
     section.append(Some("Move to Trash"), Some("win.trash"));
+    section.append(Some("Preferences…"), Some("win.preferences"));
     section.append(Some("About"), Some("win.about"));
     let quit_section = gio::Menu::new();
     quit_section.append(Some("Quit"), Some("app.quit"));
@@ -463,6 +517,7 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
         s.bottom_bar = Some(bottom_outer.clone());
         s.volume_scale = Some(volume_scale);
         s.toast_overlay = Some(toast_overlay.clone());
+        s.main_overlay = Some(overlay.clone());
     }
 
     // ── Auto-hide + mouse tracking (Showtime-style, overlay transparent, no push) ──
@@ -587,18 +642,52 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
         let empty_status_clone = empty_status.clone();
         drop_target.connect_drop(move |_, value, _, _| {
             if let Ok(file_list) = value.get::<gdk::FileList>() {
-                let paths: Vec<PathBuf> = file_list
-                    .files()
-                    .iter()
-                    .filter_map(|f| f.path())
-                    .filter(|p| p.is_file())
-                    .collect();
-                if paths.is_empty() {
+                let gfiles = file_list.files();
+                if let Some(first) = gfiles.first() {
+                    debug_log(&format!(
+                        "drop: uri={} has_local_path={}",
+                        first.uri(),
+                        first.path().is_some()
+                    ));
+                }
+                // Local paths, split into files and dropped folders. Stat can
+                // fail in the sandbox while GIO still reads, so trust the
+                // extension as a last resort before giving up.
+                let mut paths: Vec<PathBuf> = Vec::new();
+                let mut dirs: Vec<PathBuf> = Vec::new();
+                for p in gfiles.iter().filter_map(|f| f.path()) {
+                    if p.is_dir() {
+                        dirs.push(p);
+                    } else if p.is_file() || is_media(&p) {
+                        paths.push(p);
+                    }
+                }
+                if paths.is_empty() && dirs.is_empty() {
                     return false;
                 }
-                // Load all media from the parent directory of the first dropped file
-                let read_dir = paths[0].parent().unwrap_or(Path::new(".")).to_path_buf();
-                let mut files = state::collect_media(&read_dir);
+                // Dropped folders define their own scope (the portal exports
+                // a dropped folder's subtree, so this works for sandboxed
+                // gvfs drops too): dropped media files first, then each
+                // folder's listing in drop order.
+                let via_portal = paths
+                    .first()
+                    .or(dirs.first())
+                    .map(|p| is_doc_portal_path(p))
+                    .unwrap_or(false);
+                let mut files: Vec<PathBuf> =
+                    paths.iter().filter(|p| is_media(p)).cloned().collect();
+                for dir in &dirs {
+                    files.extend(collect_dir_media(dir));
+                }
+                if !via_portal && dirs.is_empty() {
+                    // Plain local file drop: browse the whole parent folder.
+                    let read_dir = paths[0].parent().unwrap_or(Path::new(".")).to_path_buf();
+                    let listed = collect_dir_media(&read_dir);
+                    if !listed.is_empty() {
+                        files = listed;
+                    }
+                    // Else keep just the dropped files (set above).
+                }
                 // If directory listing failed (e.g. sandbox), fall back to dropped files only
                 if files.is_empty() {
                     files = paths.iter().filter(|p| is_media(p)).cloned().collect();
@@ -606,7 +695,11 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
                 if files.is_empty() {
                     return false;
                 }
-                let start_index = files.iter().position(|f| f == &paths[0]).unwrap_or(0);
+                let start_index = paths
+                    .first()
+                    .and_then(|p| files.iter().position(|f| f == p))
+                    .unwrap_or(0);
+                cancel_slide(&state);
                 {
                     let mut s = state.borrow_mut();
                     s.files = files;
@@ -645,6 +738,16 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
         });
     }
     window.add_action(&about_action);
+
+    let preferences_action = gio::SimpleAction::new("preferences", None);
+    {
+        let state = state.clone();
+        let window = window.clone();
+        preferences_action.connect_activate(move |_, _| {
+            show_preferences(&state, &window);
+        });
+    }
+    window.add_action(&preferences_action);
 
     let close_action = gio::SimpleAction::new("close", None);
     {
@@ -702,6 +805,7 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
                             }
                         }
                         let start_index = files.iter().position(|f| f == &path).unwrap_or(0);
+                        cancel_slide(&state);
                         {
                             let mut s = state.borrow_mut();
                             s.files = files;
@@ -748,6 +852,7 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
                             show_toast(&state, "No images or videos in this folder");
                             return;
                         }
+                        cancel_slide(&state);
                         {
                             let mut s = state.borrow_mut();
                             s.files = files;
@@ -858,6 +963,7 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
             gdk::Key::Home => {
                 let len = state.borrow().files.len();
                 if len > 0 {
+                    cancel_slide(&state);
                     {
                         let mut s = state.borrow_mut();
                         s.index = 0;
@@ -872,6 +978,7 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
             gdk::Key::End => {
                 let len = state.borrow().files.len();
                 if len > 0 {
+                    cancel_slide(&state);
                     {
                         let mut s = state.borrow_mut();
                         s.index = len - 1;
@@ -1171,7 +1278,24 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
         picture.add_controller(click);
     }
 
-    // ── 3-finger swipe: prev/next item ──
+    // ── 3-finger touchpad drag: both items follow the finger ──
+    // Raw TouchpadSwipe phases (GestureSwipe only fires after release).
+    // Other touchpad traffic (2-finger scroll, pinch) passes through.
+    {
+        let pad = gtk::EventControllerLegacy::new();
+        pad.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let state_c = state.clone();
+        let picture_c = picture.clone();
+        let scrolled_c = scrolled.clone();
+        let window_c = window.clone();
+        pad.connect_event(move |_, event| {
+            handle_touchpad(&state_c, &picture_c, &scrolled_c, &window_c, event)
+        });
+        scrolled.add_controller(pad);
+    }
+
+    // ── 3-finger swipe: prev/next item (touchscreens; touchpad drags
+    // consumed interactively above are skipped via last_drag_us) ──
     {
         let swipe = gtk::GestureSwipe::builder().n_points(3).build();
         let state = state.clone();
@@ -1179,6 +1303,10 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
         let scrolled_s = scrolled.clone();
         let window_w = window.clone();
         swipe.connect_swipe(move |_, vx, vy| {
+            let fresh = glib::monotonic_time() - state.borrow().last_drag_us > 150_000;
+            if !fresh {
+                return;
+            }
             if vx.abs() > vy.abs() && vx.abs() > 0.3 {
                 if vx < 0.0 {
                     nav(&state, &picture, &scrolled_s, &window_w, 1);
@@ -1268,12 +1396,14 @@ fn sync_play_button(btn: &gtk::Button, playing: bool) {
 }
 
 fn toggle_play_pause(state: &Rc<RefCell<AppState>>) {
-    let (media, btn) = {
+    // (Copied out: pause()/play() synchronously emit playing notifies
+    // whose handlers borrow state — no borrow may be held here.)
+    let (media, btn, is_video) = {
         let s = state.borrow();
-        (s.media_file.clone(), s.play_pause_btn.clone())
+        (s.media_file.clone(), s.play_pause_btn.clone(), s.is_video)
     };
     if let (Some(media), Some(btn)) = (media, btn) {
-        if state.borrow().is_video {
+        if is_video {
             if media.is_playing() {
                 media.pause();
                 sync_play_button(&btn, false);
@@ -1370,6 +1500,58 @@ fn is_doc_portal_path(path: &Path) -> bool {
         .map(|r| PathBuf::from(r).join("doc"))
         .unwrap_or_else(|_| PathBuf::from("/run/user/1000/doc"));
     path.starts_with(&doc_dir)
+}
+
+/// List media directly inside `dir`: plain read_dir first, gvfs-daemon
+/// enumeration when the sandbox blocks readdir.
+fn collect_dir_media(dir: &Path) -> Vec<PathBuf> {
+    let listed = state::collect_media(dir);
+    if !listed.is_empty() {
+        return listed;
+    }
+    let fallback = collect_media_gio(&gio::File::for_path(dir));
+    debug_log(&format!(
+        "drop GIO fallback: {} siblings for {}",
+        fallback.len(),
+        dir.display()
+    ));
+    fallback
+}
+/// Sibling media via GIO enumeration (gvfs/sandbox fallback).
+/// `std::fs::read_dir` can fail inside the sandbox even when the dropped
+/// file itself is readable (fuse mounts, portal-adjacent paths), while
+/// enumeration via the gvfs daemon (org.gtk.vfs) still succeeds. Trusts
+/// the enumerator's file type instead of re-statting (stat can hit the
+/// same sandbox wall). Returns local paths only; pure remote URIs
+/// (no FUSE path) yield nothing and callers fall back to dropped files.
+fn collect_media_gio(parent: &gio::File) -> Vec<PathBuf> {
+    let Ok(enumerator) = parent.enumerate_children(
+        "standard::name,standard::type",
+        gio::FileQueryInfoFlags::NONE,
+        None::<&gio::Cancellable>,
+    ) else {
+        debug_log(&format!(
+            "collect_media_gio: enumerate({}) failed",
+            parent.uri()
+        ));
+        return Vec::new();
+    };
+    let mut files = Vec::new();
+    while let Ok(Some(info)) = enumerator.next_file(None::<&gio::Cancellable>) {
+        if info.file_type() != gio::FileType::Regular {
+            continue;
+        }
+        let name = info.name();
+        let name_str = name.to_string_lossy();
+        if !state::is_media(Path::new(name_str.as_ref())) {
+            continue;
+        }
+        if let Some(path) = parent.child(name_str.as_ref()).path() {
+            files.push(path);
+        }
+    }
+    state::sort_media_paths(&mut files);
+    files
 }
 
 fn reset_scroll(scrolled: &gtk::ScrolledWindow) {
@@ -1553,14 +1735,1031 @@ fn nav(
             return;
         }
     };
+    // Rapid navigation mid-slide cuts instantly so spam stays fast.
+    if state.borrow().sliding {
+        cancel_slide(state);
+    }
+    // Adjacent steps cross-slide; anything else cuts instantly.
+    if dir != 0 && try_slide_to(state, picture, scrolled, window, new_index, dir) {
+        return;
+    }
     {
         let mut s = state.borrow_mut();
         s.index = new_index;
         s.zoom = 1.0;
     }
-    scrolled.hadjustment().set_value(0.0);
-    scrolled.vadjustment().set_value(0.0);
+    reset_scroll(scrolled);
     show_file(state, picture, scrolled, window);
+}
+
+/// Outgoing frame for a slide: paintable + fit + size.
+struct OldFrame {
+    tex: gdk::Paintable,
+    fit: gtk::ContentFit,
+    ow: i32,
+    oh: i32,
+}
+
+/// Capture the outgoing frame before switching. Images share their
+/// immutable Texture; videos get a frozen wrapper around the paused
+/// MediaFile so the shared live view can move on to the new item.
+/// Sized exactly like the current allocation (`w`/`h` fallback).
+fn old_frame(
+    state: &Rc<RefCell<AppState>>,
+    picture: &gtk::Picture,
+    w: i32,
+    h: i32,
+) -> Option<OldFrame> {
+    let (paintable, fit, was_video, old_media, old_view) = {
+        let s = state.borrow();
+        (
+            picture.paintable(),
+            picture.content_fit(),
+            s.is_video,
+            s.media_file.clone(),
+            s.video_view.view(),
+        )
+    };
+    let paintable = paintable?;
+    let (tex, fit): (gdk::Paintable, gtk::ContentFit) = if was_video {
+        if let Some(old_media) = old_media {
+            let zp = ZoomPaintable::new();
+            zp.set_inner(Some(old_media.upcast()));
+            zp.set_view(old_view.0, old_view.1, old_view.2);
+            (zp.upcast(), gtk::ContentFit::Fill)
+        } else {
+            (paintable, fit)
+        }
+    } else {
+        (paintable, fit)
+    };
+    let (pw, ph) = (picture.width(), picture.height());
+    let (ow, oh) = if pw > 1 && ph > 1 { (pw, ph) } else { (w, h) };
+    Some(OldFrame { tex, fit, ow, oh })
+}
+
+/// Opaque black stage holding the outgoing frame, added above the content
+/// (below the floating video controls). GtkFixed positions children
+/// absolutely, so per-frame moves never renegotiate sizes (no measure
+/// warnings, no squash); the window clips the off-screen travel.
+struct StagePieces {
+    overlay: gtk::Overlay,
+    stage: gtk::Fixed,
+    old_pic: gtk::Picture,
+    obx: f64,
+    oby: f64,
+    gen: u64,
+}
+
+fn build_stage(
+    state: &Rc<RefCell<AppState>>,
+    old: &OldFrame,
+    w: i32,
+    h: i32,
+) -> Option<StagePieces> {
+    let overlay = { state.borrow().main_overlay.clone() };
+    let overlay = overlay?;
+    let stage = gtk::Fixed::new();
+    stage.set_hexpand(true);
+    stage.set_vexpand(true);
+    stage.set_halign(gtk::Align::Fill);
+    stage.set_valign(gtk::Align::Fill);
+    stage.set_can_target(false);
+    stage.add_css_class("carosello-scrolled");
+
+    let old_pic = gtk::Picture::builder()
+        .paintable(&old.tex)
+        .content_fit(old.fit)
+        .width_request(old.ow)
+        .height_request(old.oh)
+        .can_shrink(true)
+        .build();
+    old_pic.set_can_target(false);
+    let obx = ((w - old.ow) as f64) / 2.0;
+    let oby = ((h - old.oh) as f64) / 2.0;
+    stage.put(&old_pic, obx, oby);
+    overlay.add_overlay(&stage);
+    // Keep floating video controls above the sliding frames.
+    if let Some(bottom) = state.borrow().bottom_bar.clone() {
+        if bottom.parent().is_some() {
+            overlay.remove_overlay(&bottom);
+            overlay.add_overlay(&bottom);
+        }
+    }
+    let gen = {
+        let mut s = state.borrow_mut();
+        s.slide_gen = s.slide_gen.wrapping_add(1);
+        s.slide_fixed = Some(stage.clone());
+        s.sliding = true;
+        s.slide_gen
+    };
+    Some(StagePieces {
+        overlay,
+        stage,
+        old_pic,
+        obx,
+        oby,
+        gen,
+    })
+}
+
+/// Cross-slide to `new_index`: the outgoing frame and the incoming frame
+/// (fully scaled before it moves) travel together — outgoing 0→∓W while
+/// incoming ±W→0 over ~220ms. The main view switches underneath via the
+/// regular `show_file` path, so steady-state behavior is unchanged; the
+/// overlay stage is purely visual and removed at the end.
+///
+/// Images animate only when the frame is immediately ready (prefetch hit)
+/// and fall back to an instant cut otherwise — never slide a placeholder
+/// in, never decode twice. Videos slide once prepared with a known size
+/// (2s timeout reveals the main view). Returns true when the switch was
+/// taken over.
+fn try_slide_to(
+    state: &Rc<RefCell<AppState>>,
+    picture: &gtk::Picture,
+    scrolled: &gtk::ScrolledWindow,
+    window: &adw::ApplicationWindow,
+    new_index: usize,
+    dir: i32,
+) -> bool {
+    let (vw, vh) = viewport_size(scrolled);
+    if vw < 1.0 || vh < 1.0 || !animations_enabled(state) {
+        return false;
+    }
+    let w = vw as i32;
+    let h = vh as i32;
+    if state.borrow().zoom > 1.05 {
+        return false;
+    }
+    let Some(old) = old_frame(state, picture, w, h) else {
+        return false;
+    };
+    let path = { state.borrow().files.get(new_index).cloned() };
+    let Some(path) = path else { return false };
+    let new_is_video = state::has_ext(&path, state::VIDEO_EXTS);
+
+    // Incoming images must be ready now (peek, don't consume: the main
+    // fast path still takes the cache entry for itself). Prefetch stores
+    // EXIF-oriented pixels, so use them as-is (re-applying orientation
+    // would rotate portrait shots twice and glitch the transition).
+    let new_image: Option<(gdk::Paintable, i32, i32)> = if !new_is_video {
+        // (Two statements: the borrow must end before the pixels are used.)
+        let cached = state.borrow().prefetch.get(&path).cloned();
+        let Some(raw) = cached else {
+            return false;
+        };
+        let (iw, ih) = (raw.width().max(1), raw.height().max(1));
+        let tex: gdk::Paintable = media::texture_for_pixbuf(&raw).upcast();
+        Some((tex, iw, ih))
+    } else {
+        None
+    };
+
+    // Commit the switch underneath first: title, controls, pipelines and
+    // the main paintable all follow the regular path.
+    {
+        let mut s = state.borrow_mut();
+        s.index = new_index;
+        s.zoom = 1.0;
+    }
+    reset_scroll(scrolled);
+    show_file(state, picture, scrolled, window);
+
+    let Some(pieces) = build_stage(state, &old, w, h) else {
+        return true;
+    };
+    let my_gen = pieces.gen;
+    let StagePieces {
+        overlay,
+        stage,
+        old_pic,
+        obx,
+        oby,
+        ..
+    } = pieces;
+
+    if let Some((tex, iw, ih)) = new_image {
+        let (dw, dh) = zoom::display_size_for(iw as f64, ih as f64, vw, vh, 1.0);
+        let new_pic = gtk::Picture::builder()
+            .paintable(&tex)
+            .content_fit(gtk::ContentFit::Contain)
+            .width_request(dw)
+            .height_request(dh)
+            .can_shrink(true)
+            .build();
+        new_pic.set_can_target(false);
+        let nbx = ((w - dw) as f64) / 2.0;
+        let nby = ((h - dh) as f64) / 2.0;
+        stage.put(&new_pic, nbx + direction_offset(dir, w), nby);
+        let ctx = SlideCtx {
+            state: state.clone(),
+            overlay,
+            stage,
+            old_pic,
+            obx,
+            oby,
+            w,
+            h,
+            vw,
+            vh,
+            dir,
+            my_gen,
+            new_index,
+        };
+        start_slide_tick(
+            &ctx,
+            &new_pic,
+            nbx,
+            nby,
+            0.0,
+            -direction_offset(dir, w),
+            state::SLIDE_MICROS,
+        );
+    } else {
+        let ctx = SlideCtx {
+            state: state.clone(),
+            overlay,
+            stage,
+            old_pic,
+            obx,
+            oby,
+            w,
+            h,
+            vw,
+            vh,
+            dir,
+            my_gen,
+            new_index,
+        };
+        preload_slide_video(&ctx, &path);
+    }
+    true
+}
+
+/// Signed off-screen origin for the incoming frame: right of stage for
+/// next, left of stage for previous.
+fn direction_offset(dir: i32, w: i32) -> f64 {
+    if dir > 0 {
+        w as f64
+    } else {
+        -(w as f64)
+    }
+}
+
+/// Everything a running slide needs: stage widgets, geometry bases and the
+/// generation/index guards. Bundled so helpers stay under the argument
+/// limit and can't drift out of sync.
+#[derive(Clone)]
+struct SlideCtx {
+    state: Rc<RefCell<AppState>>,
+    overlay: gtk::Overlay,
+    stage: gtk::Fixed,
+    old_pic: gtk::Picture,
+    obx: f64,
+    oby: f64,
+    w: i32,
+    h: i32,
+    vw: f64,
+    vh: f64,
+    dir: i32,
+    my_gen: u64,
+    new_index: usize,
+}
+
+/// Incoming video for a slide: its own muted pipeline + wrapper, traveling
+/// once prepared with a known intrinsic size (then pre-scaled like the
+/// main path). Weak refs only, so abandoning never leaks a pipeline.
+fn preload_slide_video(ctx: &SlideCtx, path: &Path) {
+    let media = gtk::MediaFile::for_filename(path);
+    media.set_loop(true);
+    media.set_muted(true);
+    media.set_volume(1.0);
+    let wrap = ZoomPaintable::new();
+    wrap.set_inner(Some(media.clone().upcast()));
+    let new_pic = gtk::Picture::builder()
+        .content_fit(gtk::ContentFit::Fill)
+        .width_request(ctx.w)
+        .height_request(ctx.h)
+        .can_shrink(true)
+        .build();
+    let paintable: gdk::Paintable = wrap.clone().upcast();
+    new_pic.set_paintable(Some(&paintable));
+    new_pic.set_can_target(false);
+    ctx.stage
+        .put(&new_pic, direction_offset(ctx.dir, ctx.w), 0.0);
+
+    let started: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    let size_handler: Rc<RefCell<Option<glib::SignalHandlerId>>> = Rc::new(RefCell::new(None));
+    // (Two statements: each lookup must finish before the mutable borrow
+    // below, else RefCell panics.)
+    let weak_media = media.downgrade();
+    let weak_wrap = wrap.downgrade();
+    let maybe_start = {
+        let ctx = ctx.clone();
+        let new_pic = new_pic.clone();
+        let started = started.clone();
+        let size_handler = size_handler.clone();
+        move || {
+            if started.get() {
+                return;
+            }
+            let Some(m) = weak_media.upgrade() else {
+                return;
+            };
+            let Some((sw, sh)) = zoom::video_intrinsic(&m) else {
+                return;
+            };
+            // Superseded (rapid nav, Home/End, trash): reveal, never slide stale frames.
+            {
+                let s = ctx.state.borrow();
+                if s.slide_gen != ctx.my_gen || s.index != ctx.new_index {
+                    return;
+                }
+            }
+            let (dw, dh) = zoom::display_size_for(sw, sh, ctx.vw, ctx.vh, 1.0);
+            let (fw, fh) = zoom::fit_size(sw, sh, ctx.vw, ctx.vh);
+            if let Some(wp) = weak_wrap.upgrade() {
+                wp.set_view(fw, fh, 1.0);
+            }
+            new_pic.set_size_request(dw, dh);
+            let nbx = ((ctx.w - dw) as f64) / 2.0;
+            let nby = ((ctx.h - dh) as f64) / 2.0;
+            ctx.stage
+                .move_(&new_pic, nbx + direction_offset(ctx.dir, ctx.w), nby);
+            started.set(true);
+            if let Some(hid) = size_handler.borrow_mut().take() {
+                m.disconnect(hid);
+            }
+            // Both frames placed and pre-scaled: travel together.
+            start_slide_tick(
+                &ctx,
+                &new_pic,
+                nbx,
+                nby,
+                0.0,
+                -direction_offset(ctx.dir, ctx.w),
+                state::SLIDE_MICROS,
+            );
+        }
+    };
+    // NOTE: the outgoing origin (obx/oby) is captured by the caller from
+    // the live allocation; the tick below moves both frames together.
+    {
+        let maybe_start_c = maybe_start.clone();
+        let id = media.connect_invalidate_size(move |_| {
+            maybe_start_c();
+        });
+        *size_handler.borrow_mut() = Some(id);
+    }
+    {
+        let maybe_start_c = maybe_start.clone();
+        let weak_play = media.downgrade();
+        media.connect_prepared_notify(move |_| {
+            if let Some(m) = weak_play.upgrade() {
+                m.play();
+            }
+            maybe_start_c();
+        });
+        if media.is_prepared() {
+            media.play();
+            maybe_start();
+        }
+    }
+    {
+        let ctx = ctx.clone();
+        media.connect_error_notify(move |_| {
+            abandon_slide(&ctx.state, ctx.my_gen);
+        });
+    }
+    // Stuck pipeline (slow mount, missing codec with no error yet):
+    // reveal the main view instead of covering it forever.
+    {
+        let ctx = ctx.clone();
+        let started = started.clone();
+        glib::timeout_add_local_once(Duration::from_millis(2000), move || {
+            if !started.get() {
+                abandon_slide(&ctx.state, ctx.my_gen);
+            }
+        });
+    }
+}
+
+/// Animate both frames from `from_dx` to `to_dx` over `dur` microseconds
+/// once both are placed (incoming pre-scaled). A fire-and-forget slide
+/// runs 0→∓W in 220ms; a drag release settles from the finger offset over
+/// a distance-scaled duration. Steady-state widgets are untouched.
+fn start_slide_tick(
+    ctx: &SlideCtx,
+    new_pic: &gtk::Picture,
+    nbx: f64,
+    nby: f64,
+    from_dx: f64,
+    to_dx: f64,
+    dur: i64,
+) {
+    let start = glib::monotonic_time();
+    let dur = dur.max(1) as f64;
+    let off = direction_offset(ctx.dir, ctx.w);
+    let (obx, oby) = (ctx.obx, ctx.oby);
+    let ctx_c = ctx.clone();
+    let (old_c, new_c) = (ctx.old_pic.clone(), new_pic.clone());
+    let stage_c = ctx.stage.clone();
+    ctx.stage.add_tick_callback(move |_, _| {
+        let now = glib::monotonic_time();
+        let t = ((now - start) as f64 / dur).clamp(0.0, 1.0);
+        // Ease-out cubic: fast start, gentle stop. Keeps perceived nav fast.
+        let eased = 1.0 - (1.0 - t).powi(3);
+        let dx = from_dx + (to_dx - from_dx) * eased;
+        stage_c.move_(&old_c, obx + dx, oby);
+        stage_c.move_(&new_c, nbx + off + dx, nby);
+        if t >= 1.0 {
+            finish_slide(&ctx_c.state, &ctx_c.overlay, &stage_c, ctx_c.my_gen);
+            glib::ControlFlow::Break
+        } else {
+            glib::ControlFlow::Continue
+        }
+    });
+}
+
+/// Remove a stale slide stage without touching a newer slide's state.
+fn abandon_slide(state: &Rc<RefCell<AppState>>, my_gen: u64) {
+    let s = state.borrow();
+    if s.slide_gen != my_gen {
+        return;
+    }
+    let (overlay, fixed) = (s.main_overlay.clone(), s.slide_fixed.clone());
+    drop(s);
+    if let (Some(overlay), Some(fixed)) = (overlay, fixed) {
+        if fixed.parent().is_some() {
+            overlay.remove_overlay(&fixed);
+        }
+    }
+    let mut s = state.borrow_mut();
+    if s.slide_gen == my_gen {
+        s.slide_fixed = None;
+        s.sliding = false;
+    }
+}
+
+fn finish_slide(
+    state: &Rc<RefCell<AppState>>,
+    overlay: &gtk::Overlay,
+    stage: &gtk::Fixed,
+    my_gen: u64,
+) {
+    if stage.parent().is_some() {
+        overlay.remove_overlay(stage);
+    }
+    let mut s = state.borrow_mut();
+    if s.slide_gen == my_gen && s.slide_fixed.as_ref().is_some_and(|f| f == stage) {
+        s.slide_fixed = None;
+        s.sliding = false;
+    }
+}
+
+/// Remove any running slide or drag overlay immediately (rapid-nav fast
+/// path and all instant-switch paths: Home/End, trash, open, drop).
+fn cancel_slide(state: &Rc<RefCell<AppState>>) {
+    let (overlay, fixed) = {
+        let mut s = state.borrow_mut();
+        s.sliding = false;
+        s.slide_gen = s.slide_gen.wrapping_add(1);
+        s.drag = None;
+        (s.main_overlay.clone(), s.slide_fixed.take())
+    };
+    if let (Some(overlay), Some(fixed)) = (overlay, fixed) {
+        if fixed.parent().is_some() {
+            overlay.remove_overlay(&fixed);
+        }
+    }
+}
+
+/// Instant index switch following the regular path (drag releases that
+/// commit without an animation, e.g. unready incoming video).
+fn commit_index(
+    state: &Rc<RefCell<AppState>>,
+    picture: &gtk::Picture,
+    scrolled: &gtk::ScrolledWindow,
+    window: &adw::ApplicationWindow,
+    new_index: usize,
+) {
+    {
+        let mut s = state.borrow_mut();
+        s.index = new_index;
+        s.zoom = 1.0;
+    }
+    reset_scroll(scrolled);
+    show_file(state, picture, scrolled, window);
+}
+
+/// Preferences dialog (HIG §Settings): slide-animation switch, persisted
+/// to the config file so it survives restarts (Flatpak included).
+fn show_preferences(state: &Rc<RefCell<AppState>>, window: &adw::ApplicationWindow) {
+    let dialog = adw::PreferencesWindow::builder()
+        .title("Preferences")
+        .transient_for(window)
+        .modal(true)
+        .build();
+    let page = adw::PreferencesPage::builder()
+        .title("General")
+        .icon_name("emblem-system-symbolic")
+        .build();
+    let group = adw::PreferencesGroup::builder()
+        .title("Transitions")
+        .description("Slide animation between items")
+        .build();
+    let row = adw::SwitchRow::builder()
+        .title("Slide animation")
+        .subtitle("Animate transitions between items")
+        .active(state.borrow().slide_enabled)
+        .build();
+    {
+        let state = state.clone();
+        row.connect_active_notify(move |r| {
+            let enabled = r.is_active();
+            state.borrow_mut().slide_enabled = enabled;
+            state::save_slide_enabled(enabled);
+        });
+    }
+    group.add(&row);
+    page.add(&group);
+    dialog.add(&page);
+    dialog.present();
+}
+
+fn animations_enabled(state: &Rc<RefCell<AppState>>) -> bool {
+    if !state.borrow().slide_enabled {
+        return false;
+    }
+    gtk::Settings::default()
+        .map(|s| s.property::<bool>("gtk-enable-animations"))
+        .unwrap_or(true)
+}
+
+/// Continuous 3-finger touchpad swipes: while the fingers move, both the
+/// outgoing and the incoming frame travel with them; release commits past
+/// a quarter of the viewport (or on fling) and snaps back otherwise.
+/// Gtk.GestureSwipe only fires after release, so raw TouchpadSwipe phases
+/// drive the interaction; the swipe handler skips gestures consumed here
+/// (see last_drag_us).
+fn handle_touchpad(
+    state: &Rc<RefCell<AppState>>,
+    picture: &gtk::Picture,
+    scrolled: &gtk::ScrolledWindow,
+    window: &adw::ApplicationWindow,
+    event: &gdk::Event,
+) -> glib::Propagation {
+    if event.event_type() != gdk::EventType::TouchpadSwipe {
+        return glib::Propagation::Proceed;
+    }
+    let Some(tp) = event.downcast_ref::<gdk::TouchpadEvent>() else {
+        return glib::Propagation::Proceed;
+    };
+    if tp.n_fingers() != 3 {
+        return glib::Propagation::Proceed;
+    }
+    match tp.gesture_phase() {
+        gdk::TouchpadGesturePhase::Begin => drag_begin(state, picture, scrolled),
+        gdk::TouchpadGesturePhase::Update => {
+            let (dx, _) = tp.deltas();
+            drag_update(state, dx)
+        }
+        gdk::TouchpadGesturePhase::End => drag_end(state, picture, scrolled, window, false),
+        gdk::TouchpadGesturePhase::Cancel => drag_end(state, picture, scrolled, window, true),
+        _ => glib::Propagation::Proceed,
+    }
+}
+
+/// Finger touched down: snapshot the outgoing frame onto a stage. The
+/// direction (and the incoming frame) locks on first significant travel.
+fn drag_begin(
+    state: &Rc<RefCell<AppState>>,
+    picture: &gtk::Picture,
+    scrolled: &gtk::ScrolledWindow,
+) -> glib::Propagation {
+    let (vw, vh) = viewport_size(scrolled);
+    if vw < 1.0 || vh < 1.0 || !animations_enabled(state) || state.borrow().zoom > 1.05 {
+        // Zoomed: leave it to the discrete swipe (instant cut when zoomed).
+        return glib::Propagation::Proceed;
+    }
+    let active = { state.borrow().sliding || state.borrow().drag.is_some() };
+    if active {
+        cancel_slide(state);
+    }
+    let w = vw as i32;
+    let h = vh as i32;
+    let Some(old) = old_frame(state, picture, w, h) else {
+        return glib::Propagation::Proceed;
+    };
+    let Some(pieces) = build_stage(state, &old, w, h) else {
+        return glib::Propagation::Proceed;
+    };
+    // (Index first: the struct assignment below holds a mutable borrow.)
+    let index = state.borrow().index;
+    state.borrow_mut().drag = Some(DragSt {
+        stage: pieces.stage,
+        old_pic: pieces.old_pic,
+        new_pic: None,
+        obx: pieces.obx,
+        oby: pieces.oby,
+        nbx: 0.0,
+        nby: 0.0,
+        w,
+        h,
+        vw,
+        vh,
+        dir: 0,
+        new_index: index,
+        accum: 0.0,
+        ox: 0.0,
+        locked: false,
+        at_edge: false,
+        visual: true,
+        ready: false,
+        is_video: false,
+        samples: Vec::new(),
+        gen: pieces.gen,
+    });
+    glib::Propagation::Stop
+}
+
+/// Finger moved: accumulate travel, lock a direction past the deadzone and
+/// slide both frames. Returns Stop for the owned gesture stream.
+fn drag_update(state: &Rc<RefCell<AppState>>, dx: f64) -> glib::Propagation {
+    if state.borrow().drag.is_none() {
+        // Begin didn't pass the gates: stay out of the way.
+        return glib::Propagation::Proceed;
+    }
+    if !dx.is_finite() || dx == 0.0 {
+        return glib::Propagation::Stop;
+    }
+    // Track under one borrow; widget moves after it ends.
+    let locked_now = {
+        let mut s = state.borrow_mut();
+        let Some(d) = s.drag.as_mut() else {
+            return glib::Propagation::Stop;
+        };
+        d.accum += dx;
+        let now = glib::monotonic_time();
+        d.samples.push((now, d.accum));
+        while d.samples.len() > 2 && now - d.samples[0].0 > 120_000 {
+            d.samples.remove(0);
+        }
+        if !d.locked && d.accum.abs() >= state::SWIPE_LOCK_PX {
+            d.locked = true;
+            d.dir = if d.accum < 0.0 { 1 } else { -1 };
+            true
+        } else {
+            d.locked
+        }
+    };
+    if locked_now {
+        drag_lock(state);
+    }
+    // (Fresh borrows: the RefMut above ended before any widget call.)
+    let (stage, old_pic, new_pic, obx, oby, nbx, nby, off, visual) = {
+        let s = state.borrow();
+        let Some(d) = s.drag.as_ref() else {
+            return glib::Propagation::Stop;
+        };
+        if !d.locked {
+            return glib::Propagation::Stop;
+        }
+        (
+            d.stage.clone(),
+            d.old_pic.clone(),
+            d.new_pic.clone(),
+            d.obx,
+            d.oby,
+            d.nbx,
+            d.nby,
+            direction_offset(d.dir, d.w),
+            d.visual,
+        )
+    };
+    if !visual {
+        return glib::Propagation::Stop;
+    }
+    let ox = {
+        let mut s = state.borrow_mut();
+        let Some(d) = s.drag.as_mut() else {
+            return glib::Propagation::Stop;
+        };
+        let w = d.w as f64;
+        d.ox = if d.at_edge {
+            (d.accum * 0.3).clamp(-w, w)
+        } else {
+            d.accum.clamp(-w, w)
+        };
+        d.ox
+    };
+    stage.move_(&old_pic, obx + ox, oby);
+    if let Some(new_pic) = new_pic {
+        stage.move_(&new_pic, nbx + off + ox, nby);
+    }
+    glib::Propagation::Stop
+}
+
+/// Lock the drag direction on first significant travel: bounds-check the
+/// sibling and build its (pre-scaled) frame. Runs once per drag.
+fn drag_lock(state: &Rc<RefCell<AppState>>) {
+    let (dir, index, len) = {
+        let s = state.borrow();
+        let Some(d) = s.drag.as_ref() else { return };
+        (d.dir, s.index, s.files.len())
+    };
+    let target = index as i32 + dir;
+    if target < 0 || (target as usize) >= len {
+        // No sibling: rubber-band with resistance, release snaps back.
+        // An invisible placeholder keeps the settle-back path uniform.
+        let blank = gtk::Picture::new();
+        blank.set_can_target(false);
+        let mut s = state.borrow_mut();
+        let Some(d) = s.drag.as_mut() else { return };
+        if !d.locked || d.new_pic.is_some() {
+            return;
+        }
+        d.stage.put(&blank, 0.0, 0.0);
+        d.new_pic = Some(blank);
+        d.nbx = 0.0;
+        d.nby = 0.0;
+        d.at_edge = true;
+        d.ready = true;
+        return;
+    }
+    let new_index = target as usize;
+    // Geometry snapshot for the incoming frame (viewport is stable enough
+    // mid-drag that re-querying widgets is unnecessary).
+    let (path, vw, vh) = {
+        let s = state.borrow();
+        let Some(d) = s.drag.as_ref() else { return };
+        if d.new_pic.is_some() {
+            return; // already built (repeated lock call)
+        }
+        (s.files[new_index].clone(), d.vw, d.vh)
+    };
+    let new_is_video = state::has_ext(&path, state::VIDEO_EXTS);
+    // Peek before mutating (borrow discipline).
+    let have_frame = new_is_video || state.borrow().prefetch.contains_key(&path);
+    {
+        let mut s = state.borrow_mut();
+        let Some(d) = s.drag.as_mut() else { return };
+        d.new_index = new_index;
+        if !have_frame {
+            // Uncached: track blind, the release cuts instantly.
+            d.visual = false;
+            return;
+        }
+    }
+    if new_is_video {
+        drag_lock_video(state, &path, vw, vh, new_index);
+        return;
+    }
+    // Image: use the prefetched frame as-is (prefetch stores EXIF-oriented
+    // pixels; re-applying orientation would rotate portrait shots twice).
+    // (Two statements: the clone must finish before pixels are used.)
+    let raw = state.borrow().prefetch.get(&path).cloned();
+    let Some(raw) = raw else {
+        // Evicted between lock and decode: track blind, release cuts.
+        if let Some(d) = state.borrow_mut().drag.as_mut() {
+            d.visual = false;
+        }
+        return;
+    };
+    let (iw, ih) = (raw.width().max(1), raw.height().max(1));
+    let tex: gdk::Paintable = media::texture_for_pixbuf(&raw).upcast();
+    let (dw, dh) = zoom::display_size_for(iw as f64, ih as f64, vw, vh, 1.0);
+    let (stage, w, vh, dir) = {
+        let s = state.borrow();
+        let Some(d) = s.drag.as_ref() else { return };
+        (d.stage.clone(), d.w, d.vh, d.dir)
+    };
+    let new_pic = gtk::Picture::builder()
+        .paintable(&tex)
+        .content_fit(gtk::ContentFit::Contain)
+        .width_request(dw)
+        .height_request(dh)
+        .can_shrink(true)
+        .build();
+    new_pic.set_can_target(false);
+    let nbx = ((w - dw) as f64) / 2.0;
+    let nby = (vh - dh as f64) / 2.0;
+    stage.put(&new_pic, nbx + direction_offset(dir, w), nby);
+    {
+        let mut s = state.borrow_mut();
+        let Some(d) = s.drag.as_mut() else { return };
+        // Re-check: a concurrent release may have cleared the drag.
+        if !d.locked || d.new_pic.is_some() {
+            return;
+        }
+        d.new_pic = Some(new_pic);
+        d.nbx = nbx;
+        d.nby = nby;
+        d.ready = true;
+    }
+}
+
+/// Incoming video for a drag: its own muted pipeline, marked ready (and
+/// repositioned at the live finger offset) once sized. Weak refs only.
+fn drag_lock_video(state: &Rc<RefCell<AppState>>, path: &Path, vw: f64, vh: f64, new_index: usize) {
+    let media = gtk::MediaFile::for_filename(path);
+    media.set_loop(true);
+    media.set_muted(true);
+    media.set_volume(1.0);
+    let wrap = ZoomPaintable::new();
+    wrap.set_inner(Some(media.clone().upcast()));
+    let (stage, w, h, dir, gen) = {
+        let s = state.borrow();
+        let Some(d) = s.drag.as_ref() else { return };
+        (d.stage.clone(), d.w, d.h, d.dir, d.gen)
+    };
+    let new_pic = gtk::Picture::builder()
+        .content_fit(gtk::ContentFit::Fill)
+        .width_request(w)
+        .height_request(h)
+        .can_shrink(true)
+        .build();
+    let paintable: gdk::Paintable = wrap.clone().upcast();
+    new_pic.set_paintable(Some(&paintable));
+    new_pic.set_can_target(false);
+    stage.put(&new_pic, direction_offset(dir, w), 0.0);
+    {
+        let mut s = state.borrow_mut();
+        let Some(d) = s.drag.as_mut() else { return };
+        if !d.locked || d.new_pic.is_some() {
+            return;
+        }
+        d.new_pic = Some(new_pic.clone());
+        d.is_video = true;
+    }
+    let started: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    let size_handler: Rc<RefCell<Option<glib::SignalHandlerId>>> = Rc::new(RefCell::new(None));
+    let weak_media = media.downgrade();
+    let weak_wrap = wrap.downgrade();
+    let maybe_ready = {
+        let state = state.clone();
+        let stage = stage.clone();
+        let new_pic = new_pic.clone();
+        let started = started.clone();
+        let size_handler = size_handler.clone();
+        move || {
+            if started.get() {
+                return;
+            }
+            let Some(m) = weak_media.upgrade() else {
+                return;
+            };
+            let Some((sw, sh)) = zoom::video_intrinsic(&m) else {
+                return;
+            };
+            {
+                let s = state.borrow();
+                if s.slide_gen != gen || s.index == new_index {
+                    // Superseded, or main already committed: never touch.
+                    return;
+                }
+                let Some(d) = s.drag.as_ref() else {
+                    return;
+                };
+                if !d.locked {
+                    return;
+                }
+            }
+            let (dw, dh) = zoom::display_size_for(sw, sh, vw, vh, 1.0);
+            let (fw, fh) = zoom::fit_size(sw, sh, vw, vh);
+            if let Some(wp) = weak_wrap.upgrade() {
+                wp.set_view(fw, fh, 1.0);
+            }
+            new_pic.set_size_request(dw, dh);
+            let nbx = ((w - dw) as f64) / 2.0;
+            let nby = ((h - dh) as f64) / 2.0;
+            // Reposition at the live finger offset (the drag kept moving).
+            let ox = state.borrow().drag.as_ref().map(|d| d.ox).unwrap_or(0.0);
+            stage.move_(&new_pic, nbx + direction_offset(dir, w) + ox, nby);
+            started.set(true);
+            if let Some(hid) = size_handler.borrow_mut().take() {
+                m.disconnect(hid);
+            }
+            let mut s = state.borrow_mut();
+            if s.slide_gen == gen {
+                if let Some(d) = s.drag.as_mut() {
+                    d.nbx = nbx;
+                    d.nby = nby;
+                    d.ready = true;
+                }
+            }
+        }
+    };
+    {
+        let maybe_ready_c = maybe_ready.clone();
+        let id = media.connect_invalidate_size(move |_| {
+            maybe_ready_c();
+        });
+        *size_handler.borrow_mut() = Some(id);
+    }
+    {
+        let maybe_ready_c = maybe_ready.clone();
+        let weak_play = media.downgrade();
+        media.connect_prepared_notify(move |_| {
+            if let Some(m) = weak_play.upgrade() {
+                m.play();
+            }
+            maybe_ready_c();
+        });
+        if media.is_prepared() {
+            media.play();
+            maybe_ready();
+        }
+    }
+    {
+        let state = state.clone();
+        media.connect_error_notify(move |_| {
+            // Release will reveal the main view; mark unready now.
+            let mut s = state.borrow_mut();
+            if s.slide_gen == gen {
+                if let Some(d) = s.drag.as_mut() {
+                    d.ready = false;
+                    d.visual = false;
+                }
+            }
+        });
+    }
+}
+
+/// Finger lifted (or gesture cancelled): commit past a quarter of the
+/// viewport (or on fling) with a distance-scaled settle, else snap back.
+fn drag_end(
+    state: &Rc<RefCell<AppState>>,
+    picture: &gtk::Picture,
+    scrolled: &gtk::ScrolledWindow,
+    window: &adw::ApplicationWindow,
+    cancelled: bool,
+) -> glib::Propagation {
+    let drag = state.borrow_mut().drag.take();
+    let Some(d) = drag else {
+        return glib::Propagation::Proceed;
+    };
+    if !d.locked {
+        // Micro-gesture: reveal, no navigation.
+        abandon_slide(state, d.gen);
+        return glib::Propagation::Stop;
+    }
+    state.borrow_mut().last_drag_us = glib::monotonic_time();
+    let w_f = d.w as f64;
+    let progress = d.ox.abs() / w_f.max(1.0);
+    let velocity = state::fling_velocity(&d.samples);
+    let commit = !d.at_edge && !cancelled && state::fling_complete(progress, velocity, d.dir);
+    if commit {
+        commit_index(state, picture, scrolled, window, d.new_index);
+    }
+    if !d.visual || (commit && d.is_video && !d.ready) {
+        // Nothing (yet) to travel with: reveal the main view instantly.
+        abandon_slide(state, d.gen);
+        return glib::Propagation::Stop;
+    }
+    let Some(new_pic) = d.new_pic else {
+        abandon_slide(state, d.gen);
+        return glib::Propagation::Stop;
+    };
+    let overlay = { state.borrow().main_overlay.clone() };
+    let Some(overlay) = overlay else {
+        abandon_slide(state, d.gen);
+        return glib::Propagation::Stop;
+    };
+    let to_dx = if commit {
+        -direction_offset(d.dir, d.w)
+    } else {
+        0.0
+    };
+    let dur = state::settle_micros((to_dx - d.ox).abs(), w_f);
+    // SlideCtx carries what the tick needs; geometry comes from the drag.
+    let ctx = SlideCtx {
+        state: state.clone(),
+        overlay,
+        stage: d.stage,
+        old_pic: d.old_pic,
+        obx: d.obx,
+        oby: d.oby,
+        w: d.w,
+        h: 0,
+        vw: 0.0,
+        vh: 0.0,
+        dir: d.dir,
+        my_gen: d.gen,
+        new_index: d.new_index,
+    };
+    // Re-register: abandon_slide/finish_slide key off slide_fixed + gen.
+    {
+        let mut s = state.borrow_mut();
+        if s.slide_gen == d.gen {
+            s.slide_fixed = Some(ctx.stage.clone());
+            s.sliding = true;
+        } else {
+            return glib::Propagation::Stop;
+        }
+    }
+    start_slide_tick(&ctx, &new_pic, d.nbx, d.nby, d.ox, to_dx, dur);
+    glib::Propagation::Stop
 }
 
 /// Move the current file to Trash and advance to the next sibling.
@@ -1605,6 +2804,7 @@ fn trash_current(
     // (Two statements: the position lookup must finish before the mutable
     // borrow below, else RefCell panics.)
     let pos = state.borrow().files.iter().position(|f| f == &path);
+    cancel_slide(state);
     {
         let mut s = state.borrow_mut();
         if let Some(pos) = pos {
@@ -1685,11 +2885,15 @@ fn show_image(
     scrolled: &gtk::ScrolledWindow,
     path: &Path,
 ) {
+    // Pause outside the borrow: pause() synchronously emits playing
+    // notifies whose handlers borrow state (update_seek_ui) — pausing
+    // while mutably borrowed panics.
+    let old_media = state.borrow().media_file.clone();
+    if let Some(ref old) = old_media {
+        old.pause();
+    }
     {
         let mut s = state.borrow_mut();
-        if let Some(ref old) = s.media_file {
-            old.pause();
-        }
         s.video_gen = s.video_gen.wrapping_add(1);
         s.media_file = None;
         s.zoom = 1.0;
@@ -1966,10 +3170,14 @@ fn show_video(
     scrolled: &gtk::ScrolledWindow,
     path: &Path,
 ) {
-    let mut s = state.borrow_mut();
-    if let Some(ref old) = s.media_file {
+    // Pause outside the borrow: pause() synchronously emits playing
+    // notifies whose handlers borrow state (update_seek_ui) — pausing
+    // while mutably borrowed panics.
+    let old_media = state.borrow().media_file.clone();
+    if let Some(ref old) = old_media {
         old.pause();
     }
+    let mut s = state.borrow_mut();
     s.original_pixbuf = None;
     s.image_w = 0;
     s.image_h = 0;
@@ -2114,4 +3322,35 @@ fn show_video(
         });
     }
     update_seek_ui(state);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_collect_media_gio_matches_read_dir() {
+        let dir = std::env::temp_dir().join(format!("carosello-gio-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["IMG2.jpg", "IMG10.jpg", "img01.jpg", "note.txt"] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        let via_fs = state::collect_media(&dir);
+        let via_gio = collect_media_gio(&gio::File::for_path(&dir));
+        assert_eq!(via_gio, via_fs);
+        let names: Vec<String> = via_gio
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["img01.jpg", "IMG2.jpg", "IMG10.jpg"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_collect_media_gio_missing_dir_empty() {
+        let missing = std::env::temp_dir().join("carosello-gio-nonexistent-xyz");
+        let _ = std::fs::remove_dir_all(&missing);
+        assert!(collect_media_gio(&gio::File::for_path(&missing)).is_empty());
+    }
 }

@@ -19,6 +19,19 @@
     `host:rw`.
   - `is_doc_portal_path()` detects portal paths; `show_file()` toasts a
     hint instead of failing silently.
+- **Sandboxed drag-and-drop also arrives via the portal**: drops from Files
+  come as `file:///run/user/1000/doc/<unique-id>/<name>`, each file in its
+  **own** id dir — parent listing can never find siblings. The drop handler
+  therefore browses all dropped files for portal paths (local drops still
+  list the parent folder). Diagnose with `CAROSELLO_DEBUG=1`: the `drop:
+  uri=…` + `collect_media: N media in …` lines show the scheme and which
+  branch ran.
+- **Dropped folders define their own scope**: accept `is_dir()` drops (they
+  carry no media extension, so an `is_media`-only filter rejects them
+  silently) and list each via `collect_dir_media()` (read_dir + GIO
+  fallback). Verified: the portal exports a dropped folder's full subtree
+  (12- and 64-photo sftp folders listed fine). `start_index` must handle
+  `paths` being empty (folder-only drop).
 - No new crates / system deps without regenerating `cargo-sources.json`
   (CI regenerates it from `Cargo.lock`; keep the lockfile committed).
 

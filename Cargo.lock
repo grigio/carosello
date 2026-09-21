@@ -39,7 +39,7 @@ dependencies = [
 
 [[package]]
 name = "carosello"
-version = "1.0.7"
+version = "1.0.8"
 dependencies = [
  "gdk-pixbuf",
  "gtk4",

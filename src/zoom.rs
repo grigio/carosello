@@ -102,6 +102,11 @@ mod zoom_paintable {
             imp.zoom.set(crate::state::clamp_zoom(zoom));
             self.invalidate_size();
         }
+
+        pub fn view(&self) -> (f64, f64, f64) {
+            let imp = self.imp();
+            (imp.base_w.get(), imp.base_h.get(), imp.zoom.get())
+        }
     }
 
     impl Default for ZoomPaintable {

@@ -5,6 +5,15 @@ pub const VIDEO_EXTS: &[&str] = &["mp4", "webm", "mkv"];
 pub const ZOOM_MAX: f64 = 20.0;
 pub const ZOOM_MIN: f64 = 0.1;
 pub const MAX_DIM: f64 = 8192.0;
+/// Full cross-slide duration in microseconds (fast start, gentle stop).
+pub const SLIDE_MICROS: i64 = 220_000;
+/// Finger travel before a touchpad swipe locks a direction and builds the
+/// incoming frame (deadzone against accidental brushes).
+pub const SWIPE_LOCK_PX: f64 = 12.0;
+/// Release commits past a quarter of the viewport…
+pub const SWIPE_PROGRESS_COMMIT: f64 = 0.25;
+/// …or past a fling velocity in the travel direction (px/ms).
+pub const SWIPE_FLING_PX_PER_MS: f64 = 0.8;
 
 pub fn has_ext(path: &Path, exts: &[&str]) -> bool {
     path.extension()
@@ -17,8 +26,106 @@ pub fn is_media(path: &Path) -> bool {
     has_ext(path, IMAGE_EXTS) || has_ext(path, VIDEO_EXTS)
 }
 
+/// Config dir for user preferences (`$XDG_CONFIG_HOME/carosello`,
+/// `~/.config/carosello` fallback; remapped into the sandbox by Flatpak).
+fn config_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("XDG_CONFIG_HOME") {
+        if !dir.is_empty() {
+            return PathBuf::from(dir).join("carosello");
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() {
+            return PathBuf::from(home).join(".config").join("carosello");
+        }
+    }
+    PathBuf::from("/tmp").join("carosello-config")
+}
+
+/// Parse the slide-animation pref from settings text (default: enabled).
+fn parse_slide_enabled(text: &str) -> bool {
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            if k.trim() == "slide-animation" {
+                return !v.trim().eq_ignore_ascii_case("false");
+            }
+        }
+    }
+    true
+}
+
+/// Whether the slide animation is enabled (default true when unset or
+/// unreadable). Read from `dir/settings.conf` (tests) or the config dir.
+pub fn load_slide_enabled_from(dir: &Path) -> bool {
+    match std::fs::read_to_string(dir.join("settings.conf")) {
+        Ok(text) => parse_slide_enabled(&text),
+        Err(_) => true,
+    }
+}
+
+pub fn load_slide_enabled() -> bool {
+    load_slide_enabled_from(&config_dir())
+}
+
+/// Persist the slide-animation pref (best effort: failures are ignored so
+/// toggling never errors).
+pub fn save_slide_enabled_to(dir: &Path, enabled: bool) {
+    let _ = std::fs::create_dir_all(dir);
+    let _ = std::fs::write(
+        dir.join("settings.conf"),
+        format!("# Carosello preferences\nslide-animation = {}\n", enabled),
+    );
+}
+
+pub fn save_slide_enabled(enabled: bool) {
+    save_slide_enabled_to(&config_dir(), enabled);
+}
+
 pub fn clamp_zoom(z: f64) -> f64 {
     z.clamp(ZOOM_MIN, ZOOM_MAX)
+}
+
+/// Release decision for an interactive swipe: commit when the dragged
+/// progress passes a quarter of the viewport, or the finger flings past
+/// the velocity threshold in the travel direction (`dir`: +1 next slides
+/// left so the offset velocity is negative, and vice versa).
+pub fn fling_complete(progress: f64, velocity: f64, dir: i32) -> bool {
+    if progress >= SWIPE_PROGRESS_COMMIT {
+        return true;
+    }
+    if dir > 0 {
+        velocity < -SWIPE_FLING_PX_PER_MS
+    } else {
+        velocity > SWIPE_FLING_PX_PER_MS
+    }
+}
+
+/// Settle duration scaled by remaining travel (a full slide is 220ms,
+/// a short snap-back is much quicker).
+pub fn settle_micros(remaining: f64, total: f64) -> i64 {
+    if total < 1.0 {
+        return SLIDE_MICROS;
+    }
+    ((SLIDE_MICROS as f64 * (remaining / total)).round() as i64).clamp(60_000, SLIDE_MICROS)
+}
+
+/// Release velocity over the recent samples (px/ms, signed like the
+/// accumulated offset: negative travels left/next).
+pub fn fling_velocity(samples: &[(i64, f64)]) -> f64 {
+    if samples.len() < 2 {
+        return 0.0;
+    }
+    let (t0, x0) = samples[0];
+    let (t1, x1) = samples[samples.len() - 1];
+    let dt_ms = (t1 - t0) as f64 / 1000.0;
+    if dt_ms < 1.0 {
+        return 0.0;
+    }
+    (x1 - x0) / dt_ms
 }
 
 /// Index to show after removing `pos` from a list that now has `new_len`
@@ -88,21 +195,38 @@ impl NatPart {
     }
 }
 
+/// Sort media paths naturally by filename (`IMG2` before `IMG10`).
+pub fn sort_media_paths(files: &mut [PathBuf]) {
+    files.sort_by(|a, b| {
+        let an = a.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        let bn = b.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        natural_key(an).cmp(&natural_key(bn))
+    });
+}
+
 /// List media files in `dir`, sorted naturally by filename.
 pub fn collect_media(dir: &Path) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(err) => {
+            debug_log(&format!(
+                "collect_media: read_dir({}) failed: {err}",
+                dir.display()
+            ));
+            return Vec::new();
+        }
     };
     let mut files: Vec<PathBuf> = entries
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| p.is_file() && is_media(p))
         .collect();
-    files.sort_by(|a, b| {
-        let an = a.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-        let bn = b.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-        natural_key(an).cmp(&natural_key(bn))
-    });
+    sort_media_paths(&mut files);
+    debug_log(&format!(
+        "collect_media: {} media in {}",
+        files.len(),
+        dir.display()
+    ));
     files
 }
 
@@ -179,6 +303,31 @@ mod tests {
     }
 
     #[test]
+    fn test_slide_enabled_defaults_on() {
+        let dir = std::env::temp_dir().join("carosello-pref-missing-xyz");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(load_slide_enabled_from(&dir));
+        assert!(parse_slide_enabled(""));
+        assert!(parse_slide_enabled("# comment\n"));
+    }
+
+    #[test]
+    fn test_slide_enabled_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("carosello-pref-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        save_slide_enabled_to(&dir, false);
+        assert!(!load_slide_enabled_from(&dir));
+        save_slide_enabled_to(&dir, true);
+        assert!(load_slide_enabled_from(&dir));
+        // Unknown values and comments fall back to enabled.
+        std::fs::write(dir.join("settings.conf"), "# hi\nslide-animation = maybe\n").unwrap();
+        assert!(load_slide_enabled_from(&dir));
+        std::fs::write(dir.join("settings.conf"), "slide-animation=FALSE\n").unwrap();
+        assert!(!load_slide_enabled_from(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_index_after_removal_next_slides_in() {
         // Removing the current item keeps the index: the next sibling
         // slides into place (no reset to 0).
@@ -204,5 +353,45 @@ mod tests {
     #[test]
     fn test_index_after_removal_empty() {
         assert_eq!(index_after_removal(0, 0, 0), 0);
+    }
+
+    #[test]
+    fn test_fling_complete_by_progress() {
+        assert!(fling_complete(0.3, 0.0, 1));
+        assert!(fling_complete(0.3, 0.0, -1));
+        assert!(fling_complete(1.0, 0.0, 1));
+    }
+
+    #[test]
+    fn test_fling_complete_by_velocity() {
+        // Next travels left: fast negative velocity commits.
+        assert!(fling_complete(0.0, -2.0, 1));
+        assert!(!fling_complete(0.0, 2.0, 1));
+        // Previous travels right: mirror image.
+        assert!(fling_complete(0.0, 2.0, -1));
+        assert!(!fling_complete(0.0, -2.0, -1));
+        // Wrong-direction fling never commits on its own.
+        assert!(!fling_complete(0.1, 0.5, 1));
+    }
+
+    #[test]
+    fn test_settle_micros_scaled() {
+        assert_eq!(settle_micros(900.0, 900.0), SLIDE_MICROS);
+        assert_eq!(settle_micros(450.0, 900.0), SLIDE_MICROS / 2);
+        // Short snap-backs bottom out instead of flashing by.
+        assert_eq!(settle_micros(1.0, 900.0), 60_000);
+        assert_eq!(settle_micros(0.0, 900.0), 60_000);
+        // Degenerate viewport falls back to the full duration.
+        assert_eq!(settle_micros(10.0, 0.0), SLIDE_MICROS);
+    }
+
+    #[test]
+    fn test_fling_velocity_samples() {
+        assert_eq!(fling_velocity(&[]), 0.0);
+        assert_eq!(fling_velocity(&[(0, 0.0)]), 0.0);
+        // 200px over 100ms travelling left.
+        assert_eq!(fling_velocity(&[(0, 0.0), (100_000, -200.0)]), -2.0);
+        // Sub-millisecond spans yield zero instead of exploding.
+        assert_eq!(fling_velocity(&[(0, 0.0), (500, -200.0)]), 0.0);
     }
 }
