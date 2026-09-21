@@ -147,3 +147,10 @@ carosello /path/to/image.jpg
 ## License
 
 GPL-3.0-or-later
+
+## Donations
+
+If you find this project helpful, please consider making a donation to support its development.
+
+- **Monero**: `88LyqYXn4LdCVDtPWKuton9hJwbo8ZduNEGuARHGdeSJ79BBYWGpMQR8VGWxGDKtTLLM6E9MJm8RvW9VMUgCcSXu19L9FSv`
+- **Bitcoin**: `bc1q6mh77hfv8x8pa0clzskw6ndysujmr78j6se025`
