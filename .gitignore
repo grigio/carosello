@@ -1,6 +1,9 @@
 /target
 /builddir
 /subprojects
+/src
+/pkg
+*.pkg.tar.zst*
 .cargo/
 cargo/vendored
 cargo-sources.json
