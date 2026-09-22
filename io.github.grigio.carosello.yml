@@ -1,6 +1,6 @@
 app-id: io.github.grigio.carosello
 runtime: org.gnome.Platform
-runtime-version: '48'
+runtime-version: '51'
 branch: stable
 sdk: org.gnome.Sdk
 sdk-extensions:
