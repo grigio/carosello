@@ -337,6 +337,7 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
         let picture = picture.clone();
         let scrolled = scrolled.clone();
         zoom_reset_btn.connect_clicked(move |_| {
+            debug_log("zoom-reset: button");
             zoom_to(&state, &picture, &scrolled, 1.0, None);
         });
     }
@@ -1025,7 +1026,10 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
         let picture = picture.clone();
         let scrolled = scrolled.clone();
         let zoom_reset = gio::SimpleAction::new("zoom-reset", None);
-        zoom_reset.connect_activate(move |_, _| zoom_to(&state, &picture, &scrolled, 1.0, None));
+        zoom_reset.connect_activate(move |_, _| {
+            debug_log("zoom-reset: accel action");
+            zoom_to(&state, &picture, &scrolled, 1.0, None);
+        });
         window.add_action(&zoom_reset);
     }
 
@@ -1125,12 +1129,14 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
                 glib::Propagation::Stop
             }
             gdk::Key::_0 | gdk::Key::KP_0 if modifier.contains(gdk::ModifierType::CONTROL_MASK) => {
+                debug_log("zoom-reset: key Ctrl+0");
                 zoom_to(&state, &picture, &scrolled, 1.0, None);
                 glib::Propagation::Stop
             }
             gdk::Key::Escape => {
                 let z = state.borrow().zoom;
                 if (z - 1.0).abs() > 0.01 {
+                    debug_log("zoom-reset: key Escape");
                     zoom_to(&state, &picture, &scrolled, 1.0, None);
                     glib::Propagation::Stop
                 } else {
@@ -1396,6 +1402,10 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
             let base_zoom = base_zoom.clone();
             zoom_gesture.connect_scale_changed(move |gesture, scale| {
                 let target = (base_zoom.get() * scale).clamp(state::ZOOM_MIN, state::ZOOM_MAX);
+                debug_log(&format!(
+                    "pinch: base={:.2} scale={scale:.3} -> target={target:.2}",
+                    base_zoom.get()
+                ));
                 let anchor = if gesture.device().is_some_and(|d| d.has_cursor()) {
                     let s = state.borrow();
                     Some((s.mouse_x, s.mouse_y))
@@ -1460,11 +1470,32 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
         let state = state.clone();
         let picture_c = picture.clone();
         let scrolled_c = scrolled.clone();
-        click.connect_pressed(move |_, n_press, x, y| {
+        click.connect_pressed(move |gesture, n_press, x, y| {
             if n_press == 2 {
                 let cur = state.borrow().zoom;
                 if cur > 1.5 {
+                    debug_log(&format!("dblclick-toggle: fit (cur={cur:.2})"));
                     zoom_to(&state, &picture_c, &scrolled_c, 1.0, None);
+                } else if gesture.device().is_some_and(|d| d.has_cursor()) {
+                    // Pointer (mouse/touchpad) shares one cursor across devices,
+                    // but the press coordinates are per-device: clicking with a
+                    // device that hasn't moved since startup (or since the last
+                    // move with the *other* device) reports (0,0) and zooms
+                    // into the top-left. The motion tracker holds the live
+                    // cursor position (overlay == viewport coords, same as the
+                    // pinch path), so it stays correct either way.
+                    let (mx, my) = {
+                        let s = state.borrow();
+                        (s.mouse_x, s.mouse_y)
+                    };
+                    debug_log(&format!(
+                        "dblclick: press=({x:.0},{y:.0}) cursor=({mx:.0},{my:.0}) pic={}x{} scrolled={}x{}",
+                        picture_c.width(),
+                        picture_c.height(),
+                        scrolled_c.width(),
+                        scrolled_c.height()
+                    ));
+                    zoom_to(&state, &picture_c, &scrolled_c, 2.5, Some((mx, my)));
                 } else {
                     let pt = gtk::graphene::Point::new(x as f32, y as f32);
                     debug_log(&format!(
@@ -1919,6 +1950,9 @@ fn zoom_to(
         return;
     }
     let Some((iw, ih)) = intrinsic else {
+        debug_log(&format!(
+            "zoom_to: {old_zoom:.2} -> {new_zoom:.2} (intrinsic unknown yet)"
+        ));
         state.borrow_mut().zoom = new_zoom;
         schedule_update(state, picture, scrolled);
         return;
@@ -1933,6 +1967,10 @@ fn zoom_to(
     let old_hv = hadj.value();
     let old_vv = vadj.value();
 
+    debug_log(&format!(
+        "zoom_to: {old_zoom:.2} -> {new_zoom:.2} anchor={} ({ax:.0},{ay:.0})",
+        if anchor.is_some() { "pt" } else { "center" }
+    ));
     state.borrow_mut().zoom = new_zoom;
     schedule_update(state, picture, scrolled);
 
@@ -2043,6 +2081,7 @@ fn nav(
         s.index = new_index;
         s.zoom = 1.0;
     }
+    debug_log(&format!("nav: reset zoom to fit (index={new_index})"));
     reset_scroll(scrolled);
     show_file(state, picture, scrolled, window);
 }
@@ -2217,6 +2256,7 @@ fn try_slide_to(
         s.index = new_index;
         s.zoom = 1.0;
     }
+    debug_log(&format!("try_slide: reset zoom to fit (index={new_index})"));
     reset_scroll(scrolled);
     show_file(state, picture, scrolled, window);
 
@@ -2543,11 +2583,12 @@ fn commit_index(
         s.index = new_index;
         s.zoom = 1.0;
     }
+    debug_log(&format!(
+        "commit_index: reset zoom to fit (index={new_index})"
+    ));
     reset_scroll(scrolled);
     show_file(state, picture, scrolled, window);
 }
-
-/// Preferences dialog (HIG §Settings): switches persisted to the config
 /// file so they survive restarts (Flatpak included).
 fn show_preferences(state: &Rc<RefCell<AppState>>, window: &adw::ApplicationWindow) {
     let dialog = adw::PreferencesWindow::builder()
@@ -3452,6 +3493,10 @@ fn show_image(
         s.image_h = 0;
         s.original_pixbuf = None;
     }
+    debug_log(&format!(
+        "show_image: reset zoom to fit ({})",
+        path.display()
+    ));
 
     if let Some(ref h) = state.borrow().bottom_bar {
         h.set_visible(false);
@@ -3715,6 +3760,7 @@ fn show_video(
     s.image_gen = s.image_gen.wrapping_add(1);
     s.zoom = 1.0;
     s.is_video = true;
+    debug_log("show_video: reset zoom to fit");
     s.seeking = false;
     s.video_gen = s.video_gen.wrapping_add(1);
     s.video_w = 0;
