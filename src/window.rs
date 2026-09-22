@@ -26,8 +26,6 @@ struct AppState {
     zoom: f64,
     media_file: Option<gtk::MediaFile>,
     video_view: ZoomPaintable,
-    last_w: i32,
-    last_h: i32,
     pending_update: bool,
     is_video: bool,
     seeking: bool,
@@ -58,9 +56,12 @@ struct AppState {
     drag: Option<DragSt>,
     /// User pref: cross-slide between items (Preferences… switch).
     slide_enabled: bool,
+    /// User pref: two-finger swipe navigates (instead of three-finger).
+    /// Off by default; touchpad drags and discrete swipes gate on it.
+    two_finger_swipe: bool,
 }
 
-/// One interactive 3-finger drag: the outgoing frame plus the incoming
+/// One interactive swipe drag: the outgoing frame plus the incoming
 /// frame (once locked and built) travel with the finger on the stage.
 struct DragSt {
     stage: gtk::Fixed,
@@ -109,8 +110,6 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
         zoom: 1.0,
         media_file: None,
         video_view: ZoomPaintable::new(),
-        last_w: 0,
-        last_h: 0,
         pending_update: false,
         is_video: false,
         seeking: false,
@@ -137,6 +136,7 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
         last_drag_us: 0,
         drag: None,
         slide_enabled: state::load_slide_enabled(),
+        two_finger_swipe: state::load_two_finger_swipe(),
     }));
 
     let mut start_index: usize = 0;
@@ -906,7 +906,7 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
             // Using AlertDialog keeps compatibility with libadwaita 1.5 bindings
             let dlg = adw::AlertDialog::builder()
                 .heading("Keyboard Shortcuts")
-                .body("Navigation:\n  ← / →, Page Up / Down  —  Previous / Next\n  Home / End  —  First / Last\n  3-finger swipe  —  Previous / Next\n\nZoom:\n  Ctrl + + / −  —  Zoom In / Out\n  Ctrl + 0  —  Reset Zoom\n  Ctrl + Scroll  —  Zoom\n  Pinch  —  Zoom\n  Double-click  —  Toggle 2.5×\n  Drag  —  Pan when zoomed\n\nView:\n  F11 / F  —  Fullscreen\n  Esc  —  Reset Zoom\n\nVideo:\n  Space / K  —  Play / Pause\n  M  —  Mute\n  [ / ]  —  Seek 5 s\n  Click seek bar  —  Seek\n\nFile:\n  Del  —  Move to Trash\n\nApplication:\n  Ctrl + O  —  Open File\n  Ctrl + Shift + O  —  Open Folder\n  Ctrl + Q  —  Quit\n  Ctrl + W  —  Close\n  Ctrl + ? / Ctrl + K  —  This Help\n  F1  —  About")
+                .body("Navigation:\n  ← / →, Page Up / Down  —  Previous / Next\n  Home / End  —  First / Last\n  3-finger swipe (2-finger if enabled in Preferences)  —  Previous / Next\n\nZoom:\n  Ctrl + + / −  —  Zoom In / Out\n  Ctrl + 0  —  Reset Zoom\n  Ctrl + Scroll  —  Zoom\n  Pinch  —  Zoom\n  Double-click  —  Toggle 2.5×\n  Drag  —  Pan when zoomed\n\nView:\n  F11 / F  —  Fullscreen\n  Esc  —  Reset Zoom\n\nVideo:\n  Space / K  —  Play / Pause\n  M  —  Mute\n  [ / ]  —  Seek 5 s\n  Click seek bar  —  Seek\n\nFile:\n  Del  —  Move to Trash\n\nApplication:\n  Ctrl + O  —  Open File\n  Ctrl + Shift + O  —  Open Folder\n  Ctrl + Q  —  Quit\n  Ctrl + W  —  Close\n  Ctrl + ? / Ctrl + K  —  This Help\n  F1  —  About")
                 .build();
             dlg.add_response("close", "Close");
             dlg.set_close_response("close");
@@ -1129,7 +1129,12 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
     });
     scrolled.add_controller(scrolled_key_ctrl);
 
-    // ── Scroll: when zoomed → pan; when fit → horizontal navigates ──
+    // ── Scroll: zoomed → pan; fit + two-finger mode → swipe-navigate ──
+    // A 2-finger touchpad motion arrives as smooth scroll, not TouchpadSwipe
+    // (libinput reserves swipe gestures for 3+ fingers), so in two-finger
+    // mode the scroll deltas drive the same interactive drag machinery as
+    // the touchpad phases above: begin on first scroll, feed dx, settle on
+    // gesture end (or after a short idle — not every backend emits end).
     let scroll_ctrl = gtk::EventControllerScroll::builder()
         .flags(
             gtk::EventControllerScrollFlags::VERTICAL | gtk::EventControllerScrollFlags::HORIZONTAL,
@@ -1138,13 +1143,62 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
         .build();
     {
         let state = state.clone();
+        let picture = picture.clone();
         let scrolled = scrolled.clone();
+        let scroll_ctrl_c = scroll_ctrl.clone();
+        // Settles a scroll-driven drag now: drop a pending idle settle,
+        // then end the drag if one is still active.
+        let settle_id: Rc<Cell<Option<glib::SourceId>>> = Rc::new(Cell::new(None));
+        let settle_now: Rc<dyn Fn()> = {
+            let state = state.clone();
+            let picture = picture.clone();
+            let scrolled = scrolled.clone();
+            let window = window.clone();
+            let settle_id = settle_id.clone();
+            Rc::new(move || {
+                if let Some(id) = settle_id.take() {
+                    id.remove();
+                }
+                if state.borrow().drag.is_some() {
+                    debug_log("scroll-swipe: settle");
+                    drag_end(&state, &picture, &scrolled, &window, false);
+                }
+            })
+        };
+        {
+            let state = state.clone();
+            let picture = picture.clone();
+            let scrolled = scrolled.clone();
+            scroll_ctrl.connect_scroll_begin(move |_| {
+                let eligible = {
+                    let s = state.borrow();
+                    s.two_finger_swipe && s.zoom <= 1.05 && s.drag.is_none()
+                };
+                if eligible {
+                    drag_begin(&state, &picture, &scrolled);
+                }
+            });
+        }
+        {
+            let settle_now = settle_now.clone();
+            scroll_ctrl.connect_scroll_end(move |_| {
+                settle_now();
+            });
+        }
         scroll_ctrl.connect_scroll(move |_, dx, dy| {
             let has_content = {
                 let s = state.borrow();
                 (s.image_w > 0 && s.image_h > 0) || s.media_file.is_some()
             };
             if !has_content {
+                return glib::Propagation::Proceed;
+            }
+            // Ctrl+scroll stays a zoom gesture (handled below).
+            let is_ctrl = scroll_ctrl_c
+                .current_event()
+                .map(|e| e.modifier_state().contains(gdk::ModifierType::CONTROL_MASK))
+                .unwrap_or(false);
+            if is_ctrl {
                 return glib::Propagation::Proceed;
             }
             let zoomed = state.borrow().zoom > 1.05;
@@ -1166,7 +1220,41 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
                 return glib::Propagation::Stop;
             }
 
-            glib::Propagation::Proceed
+            if !state.borrow().two_finger_swipe {
+                return glib::Propagation::Proceed;
+            }
+            // Lazily begin for backends that skip scroll-begin.
+            if state.borrow().drag.is_none()
+                && matches!(
+                    drag_begin(&state, &picture, &scrolled),
+                    glib::Propagation::Stop
+                )
+            {
+                debug_log(&format!("scroll-swipe: begin (dx={dx:.1})"));
+            }
+            if state.borrow().drag.is_none() {
+                // Begin declined (no frame, animations off…): stay out.
+                return glib::Propagation::Proceed;
+            }
+            if dx.is_finite() && dx != 0.0 {
+                // Unmirror to finger motion (see touchpad_natural_scroll):
+                // the drag tracks fingers like TouchpadSwipe does.
+                let finger_dx = if touchpad_natural_scroll() { -dx } else { dx };
+                drag_update(&state, finger_dx);
+            }
+            // Re-arm the idle settle: continuous motion keeps feeding one
+            // drag (one navigation per swipe), a pause settles it.
+            if let Some(id) = settle_id.take() {
+                id.remove();
+            }
+            {
+                let settle_now = settle_now.clone();
+                settle_id.set(Some(glib::timeout_add_local_once(
+                    Duration::from_millis(120),
+                    move || settle_now(),
+                )));
+            }
+            glib::Propagation::Stop
         });
     }
     scrolled.add_controller(scroll_ctrl);
@@ -1288,7 +1376,19 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
                     zoom_to(&state, &picture_c, &scrolled_c, 1.0, None);
                 } else {
                     let pt = gtk::graphene::Point::new(x as f32, y as f32);
+                    debug_log(&format!(
+                        "dblclick: press=({x:.0},{y:.0}) pic={}x{} scrolled={}x{}",
+                        picture_c.width(),
+                        picture_c.height(),
+                        scrolled_c.width(),
+                        scrolled_c.height()
+                    ));
                     if let Some(conv) = picture_c.compute_point(&scrolled_c, &pt) {
+                        debug_log(&format!(
+                            "dblclick: anchor=({:.0},{:.0})",
+                            conv.x(),
+                            conv.y()
+                        ));
                         zoom_to(
                             &state,
                             &picture_c,
@@ -1296,6 +1396,11 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
                             2.5,
                             Some((conv.x() as f64, conv.y() as f64)),
                         );
+                    } else {
+                        // Coordinate conversion can fail before first layout:
+                        // still zoom (centered) instead of ignoring the click.
+                        debug_log("dblclick: compute_point failed, center fallback");
+                        zoom_to(&state, &picture_c, &scrolled_c, 2.5, None);
                     }
                 }
             }
@@ -1303,9 +1408,12 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
         picture.add_controller(click);
     }
 
-    // ── 3-finger touchpad drag: both items follow the finger ──
+    // ── Touchpad drag: both items follow the finger ──
     // Raw TouchpadSwipe phases (GestureSwipe only fires after release).
-    // Other touchpad traffic (2-finger scroll, pinch) passes through.
+    // Finger count comes from Preferences (2 when enabled, else 3);
+    // pinch passes through, and 2-finger scroll is translated into this
+    // same drag path by the scroll handler below (most systems report
+    // two fingers as scroll, not TouchpadSwipe).
     {
         let pad = gtk::EventControllerLegacy::new();
         pad.set_propagation_phase(gtk::PropagationPhase::Capture);
@@ -1319,15 +1427,25 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
         scrolled.add_controller(pad);
     }
 
-    // ── 3-finger swipe: prev/next item (touchscreens; touchpad drags
+    // ── Swipe: prev/next item (touchscreens; touchpad drags
     // consumed interactively above are skipped via last_drag_us) ──
-    {
-        let swipe = gtk::GestureSwipe::builder().n_points(3).build();
+    // `n-points` is construct-only, so register one discrete swipe per
+    // finger count and gate in the handler on the live pref: 2-finger
+    // acts only when enabled, 3-finger only when disabled.
+    for n_points in [2u32, 3u32] {
+        let swipe = gtk::GestureSwipe::builder().n_points(n_points).build();
         let state = state.clone();
         let picture = picture.clone();
         let scrolled_s = scrolled.clone();
         let window_w = window.clone();
         swipe.connect_swipe(move |_, vx, vy| {
+            if state.borrow().two_finger_swipe != (n_points == 2) {
+                return;
+            }
+            if n_points == 2 && state.borrow().zoom > 1.05 {
+                // Zoomed: two fingers pan/pinch, they never navigate.
+                return;
+            }
             let fresh = glib::monotonic_time() - state.borrow().last_drag_us > 150_000;
             if !fresh {
                 return;
@@ -1357,41 +1475,17 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
     }
 
     // ── Resize handling: viewport notifies cover drag/tile/maximize/fullscreen
-    // (all change allocation). Window width/height is a fallback for cases
-    // where the viewport size is not yet allocated. Previously 8 notifies
-    // stormed update_display; now 4 coalesced via schedule_update.
-    {
+    // (all change allocation). GtkWidget exposes no width/height GObject
+    // properties, so connect_notify on them would never fire; the scrolled
+    // viewport's page size always tracks the visible size instead, so the
+    // adjustments' `changed` signal is the reliable resize hook. Zoom's own
+    // set_value emits value-changed only, so this never self-triggers, and
+    // schedule_update coalesces bursts while update_display is idempotent.
+    for adj in [scrolled.hadjustment(), scrolled.vadjustment()] {
         let state = state.clone();
         let picture = picture.clone();
         let scrolled_w = scrolled.clone();
-        scrolled.connect_notify_local(Some("width"), move |_, _| {
-            notify_resize(&state, &picture, &scrolled_w);
-        });
-    }
-    {
-        let state = state.clone();
-        let picture = picture.clone();
-        let scrolled_w = scrolled.clone();
-        scrolled.connect_notify_local(Some("height"), move |_, _| {
-            notify_resize(&state, &picture, &scrolled_w);
-        });
-    }
-    // GTK Widget width/height also tracks allocation – handle for drag-resize.
-    {
-        let state = state.clone();
-        let picture = picture.clone();
-        let scrolled_w = scrolled.clone();
-        let win_w = window.clone().upcast::<gtk::Widget>();
-        win_w.connect_notify_local(Some("width"), move |_, _| {
-            schedule_update(&state, &picture, &scrolled_w);
-        });
-    }
-    {
-        let state = state.clone();
-        let picture = picture.clone();
-        let scrolled_w = scrolled.clone();
-        let win_w = window.clone().upcast::<gtk::Widget>();
-        win_w.connect_notify_local(Some("height"), move |_, _| {
+        adj.connect_changed(move |_| {
             schedule_update(&state, &picture, &scrolled_w);
         });
     }
@@ -1666,6 +1760,21 @@ fn zoom_by(
     );
 }
 
+/// Stillness snapshot for `zoom_to`'s re-anchor poll: both adjustment
+/// ranges, both values and the picture's size request. As long as this
+/// does not move, layout has caught up with the applied anchor.
+#[derive(Clone, Copy, PartialEq)]
+struct AnchorSnap {
+    h_upper: f64,
+    h_page: f64,
+    v_upper: f64,
+    v_page: f64,
+    h_value: f64,
+    v_value: f64,
+    pic_w: i32,
+    pic_h: i32,
+}
+
 fn zoom_to(
     state: &Rc<RefCell<AppState>>,
     picture: &gtk::Picture,
@@ -1673,8 +1782,8 @@ fn zoom_to(
     new_zoom: f64,
     anchor: Option<(f64, f64)>,
 ) {
-    let new_zoom = state::clamp_zoom(new_zoom);
-    let (old_zoom, intrinsic, viewport) = {
+    let mut new_zoom = state::clamp_zoom(new_zoom);
+    let (old_zoom, intrinsic, viewport, is_video) = {
         let s = state.borrow();
         let has_image = s.image_w > 0 && s.image_h > 0;
         if !has_image && s.media_file.is_none() {
@@ -1697,12 +1806,24 @@ fn zoom_to(
             None
         };
         let intrinsic = if s.is_video { vid } else { iw };
-        (s.zoom, intrinsic, {
-            let w = scrolled.width() as f64;
-            let h = scrolled.height() as f64;
-            (w.max(1.0), h.max(1.0))
-        })
+        let is_video = s.is_video;
+        (
+            s.zoom,
+            intrinsic,
+            {
+                let w = scrolled.width() as f64;
+                let h = scrolled.height() as f64;
+                (w.max(1.0), h.max(1.0))
+            },
+            is_video,
+        )
     };
+    // Images render at fit when zoom < 1 (Contain in a viewport-sized
+    // allocation ignores the smaller size request), so sub-fit levels are a
+    // no-op that only corrupts the next anchor ratio. Fit is the minimum.
+    if !is_video {
+        new_zoom = new_zoom.max(1.0);
+    }
     if (new_zoom - old_zoom).abs() < 0.0001 {
         return;
     }
@@ -1712,10 +1833,8 @@ fn zoom_to(
         return;
     };
     let (vw, vh) = viewport;
-    let (old_dw, old_dh) = zoom::display_size_for(iw, ih, vw, vh, old_zoom);
-    let (new_dw, new_dh) = zoom::display_size_for(iw, ih, vw, vh, new_zoom);
-    let ratio_x = new_dw as f64 / old_dw.max(1) as f64;
-    let ratio_y = new_dh as f64 / old_dh.max(1) as f64;
+    let (old_dw, old_dh) = zoom::effective_display_size_for(iw, ih, vw, vh, old_zoom, is_video);
+    let (new_dw, new_dh) = zoom::effective_display_size_for(iw, ih, vw, vh, new_zoom, is_video);
 
     let (ax, ay) = anchor.unwrap_or((vw / 2.0, vh / 2.0));
     let hadj = scrolled.hadjustment();
@@ -1726,36 +1845,82 @@ fn zoom_to(
     state.borrow_mut().zoom = new_zoom;
     schedule_update(state, picture, scrolled);
 
-    // Re-anchor scroll after layout: idle first (runs after update_display's
-    // idle), with a single 10ms retry if adjustments aren't allocated yet.
-    // Replaces the previous blind 10ms timeout race.
-    let scrolled_c = scrolled.clone();
-    glib::idle_add_local_once(move || {
-        // If layout hasn't run yet (upper bound still 0), retry once shortly.
-        let need_retry = scrolled_c.hadjustment().upper() <= 1.0
-            && scrolled_c.vadjustment().upper() <= 1.0
-            && (new_dw as f64 > vw || new_dh as f64 > vh);
-        let scrolled_a = scrolled_c.clone();
-        let apply = move || {
-            let hadj = scrolled_a.hadjustment();
-            let vadj = scrolled_a.vadjustment();
-            let new_hv = (old_hv + ax) * ratio_x - ax;
-            let new_vv = (old_vv + ay) * ratio_y - ay;
-            let h_max = (new_dw as f64 - vw).max(0.0);
-            let v_max = (new_dh as f64 - vh).max(0.0);
-            if h_max > 0.0 {
-                hadj.set_value(new_hv.clamp(0.0, h_max));
+    // Re-anchor scroll after layout. Applying only synchronously races
+    // layout: the adjustments still hold the old (often zero) range, so
+    // `set_value` clamps to the top-left and the intent is lost — that is
+    // exactly the "double-click zooms into the top-left corner" symptom.
+    // Applying from inside an adjustments `changed` emission is no better:
+    // the value is recorded but the running layout pass never repositions
+    // the child (observed: v=1050 while `compute_point` stays at (0,0)).
+    // So the anchor is applied only from outside layout — immediately
+    // (already correct when the range is final, e.g. an incremental pinch
+    // step) and then from a bounded poll — re-applied idempotently from the
+    // captured origin until the range, the value and the picture size have
+    // held still for a few ticks. A late resize (async video decode, EXIF
+    // rotation) resets that stability and gets re-anchored, while a forced
+    // clamp (portrait, where the target is unreachable) still settles.
+    // Rapid successive zooms never fight: the stale guard drops every
+    // superseded attempt.
+    let apply_anchor = {
+        let state = state.clone();
+        move |hadj: &gtk::Adjustment, vadj: &gtk::Adjustment| {
+            if (state.borrow().zoom - new_zoom).abs() > 0.0001 {
+                return; // superseded by a newer zoom
             }
-            if v_max > 0.0 {
-                vadj.set_value(new_vv.clamp(0.0, v_max));
+            let (new_hv, h_max) = zoom::anchor_target(old_hv, vw, old_dw as f64, new_dw as f64, ax);
+            let (new_vv, v_max) = zoom::anchor_target(old_vv, vh, old_dh as f64, new_dh as f64, ay);
+            let want_h = new_hv.clamp(0.0, h_max);
+            let want_v = new_vv.clamp(0.0, v_max);
+            // Only nudge GTK when the value is off target: a persistent
+            // delta means the range was still too small, so retrying picks
+            // the target up once layout has grown the upper bound.
+            if h_max > 0.0 && (hadj.value() - want_h).abs() > 0.5 {
+                hadj.set_value(want_h);
+                debug_log(&format!("zoom-anchor: h -> {want_h:.0}"));
             }
-        };
-        if need_retry {
-            glib::timeout_add_local_once(Duration::from_millis(10), apply);
-        } else {
-            apply();
+            if v_max > 0.0 && (vadj.value() - want_v).abs() > 0.5 {
+                vadj.set_value(want_v);
+                debug_log(&format!("zoom-anchor: v -> {want_v:.0}"));
+            }
         }
-    });
+    };
+    apply_anchor(&hadj, &vadj);
+    {
+        let picture = picture.clone();
+        let mut ticks: u32 = 0;
+        let mut stable: u32 = 0;
+        let mut prev: Option<AnchorSnap> = None;
+        glib::timeout_add_local(Duration::from_millis(16), move || {
+            ticks += 1;
+            apply_anchor(&hadj, &vadj);
+            let snap = AnchorSnap {
+                h_upper: hadj.upper(),
+                h_page: hadj.page_size(),
+                v_upper: vadj.upper(),
+                v_page: vadj.page_size(),
+                h_value: hadj.value(),
+                v_value: vadj.value(),
+                pic_w: picture.width(),
+                pic_h: picture.height(),
+            };
+            stable = if prev == Some(snap) { stable + 1 } else { 0 };
+            prev = Some(snap);
+            if stable >= 4 {
+                debug_log(&format!(
+                    "zoom-settled: h={:.0} v={:.0} (t={}ms)",
+                    hadj.value(),
+                    vadj.value(),
+                    ticks * 16,
+                ));
+                return glib::ControlFlow::Break;
+            }
+            if ticks >= 40 {
+                debug_log("zoom-anchor: deadline, stop re-anchoring");
+                return glib::ControlFlow::Break;
+            }
+            glib::ControlFlow::Continue
+        });
+    }
 }
 
 fn nav(
@@ -2291,8 +2456,8 @@ fn commit_index(
     show_file(state, picture, scrolled, window);
 }
 
-/// Preferences dialog (HIG §Settings): slide-animation switch, persisted
-/// to the config file so it survives restarts (Flatpak included).
+/// Preferences dialog (HIG §Settings): switches persisted to the config
+/// file so they survive restarts (Flatpak included).
 fn show_preferences(state: &Rc<RefCell<AppState>>, window: &adw::ApplicationWindow) {
     let dialog = adw::PreferencesWindow::builder()
         .title("Preferences")
@@ -2322,6 +2487,25 @@ fn show_preferences(state: &Rc<RefCell<AppState>>, window: &adw::ApplicationWind
     }
     group.add(&row);
     page.add(&group);
+    let nav_group = adw::PreferencesGroup::builder()
+        .title("Navigation")
+        .description("Swipe between items")
+        .build();
+    let fingers_row = adw::SwitchRow::builder()
+        .title("Two-finger swipe")
+        .subtitle("Use two fingers instead of three to switch items")
+        .active(state.borrow().two_finger_swipe)
+        .build();
+    {
+        let state = state.clone();
+        fingers_row.connect_active_notify(move |r| {
+            let enabled = r.is_active();
+            state.borrow_mut().two_finger_swipe = enabled;
+            state::save_two_finger_swipe(enabled);
+        });
+    }
+    nav_group.add(&fingers_row);
+    page.add(&nav_group);
     dialog.add(&page);
     dialog.present();
 }
@@ -2335,7 +2519,42 @@ fn animations_enabled(state: &Rc<RefCell<AppState>>) -> bool {
         .unwrap_or(true)
 }
 
-/// Continuous 3-finger touchpad swipes: while the fingers move, both the
+/// Finger count for swipe navigation from Preferences (2 when the
+/// two-finger switch is on, else the default 3).
+fn swipe_fingers(state: &Rc<RefCell<AppState>>) -> u32 {
+    if state.borrow().two_finger_swipe {
+        2
+    } else {
+        3
+    }
+}
+
+/// Touchpad natural-scroll pref. Scroll deltas follow scroll direction
+/// (mirrored vs finger motion when natural-scroll is on) while
+/// TouchpadSwipe deltas are raw finger motion — the scroll-fed drag
+/// unmirrors via this so both paths agree. Missing schema (non-GNOME)
+/// degrades to unmirrored rather than failing.
+fn touchpad_natural_scroll() -> bool {
+    use std::cell::OnceCell;
+    thread_local! {
+        static SETTINGS: OnceCell<Option<gio::Settings>> = const { OnceCell::new() };
+    }
+    SETTINGS.with(|cell| {
+        let settings = cell.get_or_init(|| {
+            let present = gio::SettingsSchemaSource::default().is_some_and(|src| {
+                src.lookup("org.gnome.desktop.peripherals.touchpad", false)
+                    .is_some()
+            });
+            present.then(|| gio::Settings::new("org.gnome.desktop.peripherals.touchpad"))
+        });
+        settings
+            .as_ref()
+            .map(|s| s.boolean("natural-scroll"))
+            .unwrap_or(false)
+    })
+}
+
+/// Continuous touchpad swipes: while the fingers move, both the
 /// outgoing and the incoming frame travel with them; release commits past
 /// a quarter of the viewport (or on fling) and snaps back otherwise.
 /// Gtk.GestureSwipe only fires after release, so raw TouchpadSwipe phases
@@ -2354,9 +2573,14 @@ fn handle_touchpad(
     let Some(tp) = event.downcast_ref::<gdk::TouchpadEvent>() else {
         return glib::Propagation::Proceed;
     };
-    if tp.n_fingers() != 3 {
+    if tp.n_fingers() != swipe_fingers(state) {
         return glib::Propagation::Proceed;
     }
+    debug_log(&format!(
+        "touchpad swipe: n={} phase={:?}",
+        tp.n_fingers(),
+        tp.gesture_phase()
+    ));
     match tp.gesture_phase() {
         gdk::TouchpadGesturePhase::Begin => drag_begin(state, picture, scrolled),
         gdk::TouchpadGesturePhase::Update => {
@@ -2507,6 +2731,9 @@ fn drag_lock(state: &Rc<RefCell<AppState>>) {
         let Some(d) = s.drag.as_ref() else { return };
         (d.dir, s.index, s.files.len())
     };
+    // Sibling in the travel direction: swiping toward `dir` reveals the
+    // item on that side. `dir` itself stays the travel direction, so
+    // frames keep following the finger and fling/progress math is untouched.
     let target = index as i32 + dir;
     if target < 0 || (target as usize) >= len {
         // No sibling: rubber-band with resistance, release snaps back.
@@ -3116,31 +3343,6 @@ fn viewport_size(scrolled: &gtk::ScrolledWindow) -> (f64, f64) {
         }
     }
     (vw, vh)
-}
-
-fn notify_resize(
-    state: &Rc<RefCell<AppState>>,
-    picture: &gtk::Picture,
-    scrolled: &gtk::ScrolledWindow,
-) {
-    let (vw, vh) = viewport_size(scrolled);
-    if vw < 1.0 || vh < 1.0 {
-        return;
-    }
-    let w = vw as i32;
-    let h = vh as i32;
-    let mut s = state.borrow_mut();
-    let changed = s.last_w != w || s.last_h != h;
-    if changed {
-        s.last_w = w;
-        s.last_h = h;
-    }
-    if !s.pending_update && !changed {
-        return;
-    }
-    s.pending_update = false;
-    drop(s);
-    update_display(state, picture, scrolled);
 }
 
 fn update_display(

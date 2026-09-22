@@ -43,6 +43,7 @@ fn config_dir() -> PathBuf {
 }
 
 /// Parse the slide-animation pref from settings text (default: enabled).
+/// Only an explicit `false` disables it; unknown values stay enabled.
 fn parse_slide_enabled(text: &str) -> bool {
     for line in text.lines() {
         let line = line.trim();
@@ -58,6 +59,23 @@ fn parse_slide_enabled(text: &str) -> bool {
     true
 }
 
+/// Parse the two-finger-swipe pref from settings text (default: disabled).
+/// Only an explicit `true` enables it; unknown values stay disabled.
+fn parse_two_finger_swipe(text: &str) -> bool {
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            if k.trim() == "two-finger-swipe" {
+                return v.trim().eq_ignore_ascii_case("true");
+            }
+        }
+    }
+    false
+}
+
 /// Whether the slide animation is enabled (default true when unset or
 /// unreadable). Read from `dir/settings.conf` (tests) or the config dir.
 pub fn load_slide_enabled_from(dir: &Path) -> bool {
@@ -71,18 +89,68 @@ pub fn load_slide_enabled() -> bool {
     load_slide_enabled_from(&config_dir())
 }
 
+/// Whether two-finger (instead of three-finger) swipe is enabled
+/// (default false when unset or unreadable).
+pub fn load_two_finger_swipe_from(dir: &Path) -> bool {
+    match std::fs::read_to_string(dir.join("settings.conf")) {
+        Ok(text) => parse_two_finger_swipe(&text),
+        Err(_) => false,
+    }
+}
+
+pub fn load_two_finger_swipe() -> bool {
+    load_two_finger_swipe_from(&config_dir())
+}
+
+/// Update a single `key = bool` line, preserving all other lines.
+/// Missing files start from the header comment; missing keys append.
+fn update_setting_to(dir: &Path, key: &str, enabled: bool) {
+    let path = dir.join("settings.conf");
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut lines: Vec<String> = Vec::new();
+    let mut found = false;
+    for line in existing.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') || trimmed.is_empty() {
+            lines.push(line.to_string());
+            continue;
+        }
+        if let Some((k, _)) = line.split_once('=') {
+            if k.trim() == key {
+                lines.push(format!("{key} = {enabled}"));
+                found = true;
+                continue;
+            }
+        }
+        lines.push(line.to_string());
+    }
+    if !found {
+        if lines.is_empty() {
+            lines.push("# Carosello preferences".to_string());
+        }
+        lines.push(format!("{key} = {enabled}"));
+    }
+    let _ = std::fs::create_dir_all(dir);
+    let _ = std::fs::write(path, lines.join("\n") + "\n");
+}
+
 /// Persist the slide-animation pref (best effort: failures are ignored so
 /// toggling never errors).
 pub fn save_slide_enabled_to(dir: &Path, enabled: bool) {
-    let _ = std::fs::create_dir_all(dir);
-    let _ = std::fs::write(
-        dir.join("settings.conf"),
-        format!("# Carosello preferences\nslide-animation = {}\n", enabled),
-    );
+    update_setting_to(dir, "slide-animation", enabled);
 }
 
 pub fn save_slide_enabled(enabled: bool) {
     save_slide_enabled_to(&config_dir(), enabled);
+}
+
+/// Persist the two-finger-swipe pref (best effort, preserves other keys).
+pub fn save_two_finger_swipe_to(dir: &Path, enabled: bool) {
+    update_setting_to(dir, "two-finger-swipe", enabled);
+}
+
+pub fn save_two_finger_swipe(enabled: bool) {
+    save_two_finger_swipe_to(&config_dir(), enabled);
 }
 
 pub fn clamp_zoom(z: f64) -> f64 {
@@ -324,6 +392,48 @@ mod tests {
         assert!(load_slide_enabled_from(&dir));
         std::fs::write(dir.join("settings.conf"), "slide-animation=FALSE\n").unwrap();
         assert!(!load_slide_enabled_from(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_two_finger_swipe_defaults_off() {
+        let dir = std::env::temp_dir().join("carosello-pref-2f-missing-xyz");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!load_two_finger_swipe_from(&dir));
+        assert!(!parse_two_finger_swipe(""));
+        assert!(!parse_two_finger_swipe("# comment\n"));
+        assert!(!parse_two_finger_swipe("two-finger-swipe = maybe\n"));
+        assert!(parse_two_finger_swipe("two-finger-swipe = true\n"));
+        assert!(parse_two_finger_swipe("two-finger-swipe=TRUE\n"));
+        assert!(!parse_two_finger_swipe("two-finger-swipe = false\n"));
+    }
+
+    #[test]
+    fn test_two_finger_swipe_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("carosello-pref-2f-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        save_two_finger_swipe_to(&dir, true);
+        assert!(load_two_finger_swipe_from(&dir));
+        save_two_finger_swipe_to(&dir, false);
+        assert!(!load_two_finger_swipe_from(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_prefs_preserve_each_other() {
+        let dir = std::env::temp_dir().join(format!("carosello-pref-both-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        save_slide_enabled_to(&dir, false);
+        save_two_finger_swipe_to(&dir, true);
+        assert!(!load_slide_enabled_from(&dir));
+        assert!(load_two_finger_swipe_from(&dir));
+        // Toggling one must not clobber the other.
+        save_slide_enabled_to(&dir, true);
+        assert!(load_slide_enabled_from(&dir));
+        assert!(load_two_finger_swipe_from(&dir));
+        save_two_finger_swipe_to(&dir, false);
+        assert!(load_slide_enabled_from(&dir));
+        assert!(!load_two_finger_swipe_from(&dir));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

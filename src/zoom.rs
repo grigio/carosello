@@ -174,3 +174,117 @@ pub fn display_size_for(iw: f64, ih: f64, vw: f64, vh: f64, zoom: f64) -> (i32, 
     let dh = ((fh * zoom).round()).clamp(1.0, MAX_DIM) as i32;
     (dw.max(1), dh.max(1))
 }
+
+/// Visible content size for anchor math.
+///
+/// Images render through `GtkPicture:content-fit=Contain` in a viewport-sized
+/// allocation, so zoom levels below fit still display at fit (shrinking is a
+/// no-op). Videos render through `ZoomPaintable`, which draws centered at the
+/// exact display size, so they really do shrink. Using the raw display size
+/// for images therefore inflates the zoom ratio (e.g. 0.38 → 2.5 looks like
+/// 6.6× instead of 2.5×) and the re-anchor clamps to a corner instead of
+/// keeping the cursor point stable.
+pub fn effective_display_size_for(
+    iw: f64,
+    ih: f64,
+    vw: f64,
+    vh: f64,
+    zoom: f64,
+    is_video: bool,
+) -> (i32, i32) {
+    if is_video {
+        display_size_for(iw, ih, vw, vh, zoom)
+    } else {
+        display_size_for(iw, ih, vw, vh, zoom.max(1.0))
+    }
+}
+
+/// Scroll target keeping the viewport point `anchor` stable across a zoom.
+///
+/// `old_scroll` is the current adjustment value, `vw` the viewport size,
+/// `old_w`/`new_w` the visible content sizes (see
+/// [`effective_display_size_for`]). Content smaller than the viewport is
+/// centered, so the centering offsets are accounted for; an anchor in the
+/// padding falls back to the viewport center. Returns `(target, max)` where
+/// `max` is the new scroll range (`new_w - vw`, floored at 0).
+pub fn anchor_target(old_scroll: f64, vw: f64, old_w: f64, new_w: f64, anchor: f64) -> (f64, f64) {
+    let old_w = old_w.max(1.0);
+    let new_w = new_w.max(1.0);
+    let vw = vw.max(1.0);
+    let off_old = (vw - old_w).max(0.0) / 2.0;
+    let off_new = (vw - new_w).max(0.0) / 2.0;
+    // Padding click: zoom to the center instead of flinging to an edge.
+    let ax = if anchor < off_old || anchor > off_old + old_w {
+        vw / 2.0
+    } else {
+        anchor
+    };
+    let ratio = new_w / old_w;
+    let target = (old_scroll + ax - off_old) * ratio - ax + off_new;
+    let max = (new_w - vw).max(0.0);
+    (target, max)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_effective_images_clamp_to_fit() {
+        // 16:9 image in a 16:9 viewport: fit == viewport.
+        let (fw, fh) = (892.0, 501.0);
+        let (dw, _) = display_size_for(4032.0, 2268.0, 892.0, 501.0, 0.38);
+        assert!(dw < fw as i32);
+        let (ew, eh) = effective_display_size_for(4032.0, 2268.0, 892.0, 501.0, 0.38, false);
+        let (fit_w, fit_h) = display_size_for(4032.0, 2268.0, 892.0, 501.0, 1.0);
+        assert_eq!((ew, eh), (fit_w, fit_h));
+        assert!((fw - fit_w as f64).abs() < 2.0);
+        assert!((fh - fit_h as f64).abs() < 2.0);
+        // Videos really do shrink.
+        let (vw, _) = effective_display_size_for(4032.0, 2268.0, 892.0, 501.0, 0.38, true);
+        assert_eq!(vw, dw);
+    }
+
+    #[test]
+    fn test_anchor_fit_to_zoom_keeps_cursor() {
+        // Fit 899x600 in a 900x600 viewport, click at (749,467), zoom 2.5x.
+        let (old_w, new_w) = (899.0, 2247.0);
+        let (target, max) = anchor_target(0.0, 900.0, old_w, new_w, 749.0);
+        assert!((target - 1123.0).abs() < 2.0);
+        assert!((max - 1347.0).abs() < 2.0);
+        // Same fraction of the content stays under the cursor.
+        let before = (0.0 + 749.0) / old_w;
+        let after = (target + 749.0) / new_w;
+        assert!((before - after).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_anchor_from_shrunk_image_uses_fit() {
+        // Image zoomed out to 0.38 still displays at fit (~891); zooming to
+        // 2.5 must behave like fit → 2.5, not 337 → 2227 (which clamps to max).
+        let (fit_w, new_w) = (891.0, 2227.0);
+        let (target, max) = anchor_target(0.0, 892.0, fit_w, new_w, 781.0);
+        assert!(target <= max);
+        assert!((target - 1171.0).abs() < 3.0);
+        assert!((max - 1335.0).abs() < 3.0);
+        // The old buggy ratio (337 → 2227) would land far past max.
+        let buggy = (0.0 + 781.0) * (2227.0 / 337.0) - 781.0;
+        assert!(buggy > max + 1000.0);
+    }
+
+    #[test]
+    fn test_anchor_padding_falls_back_to_center() {
+        // 300px content centered in a 900px viewport: padding click zooms centered.
+        let (target, max) = anchor_target(0.0, 900.0, 300.0, 750.0, 50.0);
+        let (center_target, _) = anchor_target(0.0, 900.0, 300.0, 750.0, 450.0);
+        assert!((target - center_target).abs() < 0.001);
+        assert_eq!(max, 0.0);
+    }
+
+    #[test]
+    fn test_anchor_large_to_large_tracks() {
+        // Already zoomed (1246px in a 900px viewport at scroll 0): cursor math holds.
+        let (target, _) = anchor_target(0.0, 900.0, 1246.0, 2247.0, 823.0);
+        assert!((target - 661.0).abs() < 3.0);
+    }
+}
