@@ -28,6 +28,33 @@ Built with **Rust** and **GTK4/libadwaita** for native Wayland/X11 support.
 
 ## Installation
 
+### Arch Linux
+
+From the AUR with an AUR helper (direct install):
+
+```bash
+yay -S carosello
+```
+
+or:
+
+```bash
+paru -S carosello
+```
+
+Without a helper:
+
+```bash
+git clone https://github.com/grigio/carosello.git
+cd carosello
+makepkg -si
+```
+
+The `PKGBUILD` builds with Meson + Cargo (`arch-meson build && meson compile -C build`)
+and installs the binary, desktop entry, AppStream metadata, and icons.
+`depends`: `gtk4`, `libadwaita`, `glib2`, `gdk-pixbuf2`, `hicolor-icon-theme`.
+Video codecs come via GStreamer (`gst-plugins-good/bad/ugly`, `gst-libav` as optdepends).
+
 ### Flatpak (recommended)
 
 Build and install the flatpak:
@@ -76,6 +103,28 @@ carosello /path/to/directory
 
 # View a specific file (shows siblings)
 carosello /path/to/image.jpg
+```
+
+## File association
+
+Carosello registers as a handler for its supported image and video types
+(`data/io.github.grigio.carosello.desktop` `MimeType`, mirrored in the
+AppStream `<provides>` block), so after install it appears in
+"Open With" for JPEG, PNG, WebP, GIF, BMP, TIFF, MP4, WebM, and MKV.
+
+To make it the default for everything it supports:
+
+```bash
+xdg-mime default io.github.grigio.carosello.desktop \
+  image/jpeg image/png image/webp image/gif image/bmp \
+  image/x-bmp image/x-ms-bmp image/tiff image/x-tiff \
+  video/mp4 video/webm video/x-matroska
+```
+
+Or per type via GIO:
+
+```bash
+gio mime image/jpeg io.github.grigio.carosello.desktop
 ```
 
 ## Keyboard Shortcuts

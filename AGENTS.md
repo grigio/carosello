@@ -35,6 +35,18 @@
 - No new crates / system deps without regenerating `cargo-sources.json`
   (CI regenerates it from `Cargo.lock`; keep the lockfile committed).
 
+## Versioning
+
+- `Cargo.toml` is the single source of truth. `meson.build` derives its
+  version via `build-aux/cargo-version.py`; the About dialog uses
+  `env!("CARGO_PKG_VERSION")`. Never hardcode a version in `meson.build`.
+- Bump with `build-aux/bump-version.sh <ver> ["notes"]` — updates
+  `Cargo.toml`, prepends the metainfo `<release>`, sets `PKGBUILD` pkgver,
+  regenerates `.SRCINFO`. Flatpak needs nothing (version shown comes from
+  the metainfo releases). Then tag `v<ver>` and run `updpkgsums`.
+- CI `versions` job fails on any drift between Cargo / metainfo / PKGBUILD /
+  .SRCINFO / git tag.
+
 ## Panics / RefCell
 
 - Never `if let Some(x) = state.borrow_mut().map.remove(k)` and then

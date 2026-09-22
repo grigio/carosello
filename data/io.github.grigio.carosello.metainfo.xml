@@ -22,6 +22,18 @@
     </ul>
   </description>
   <launchable type="desktop-id">io.github.grigio.carosello.desktop</launchable>
+  <provides>
+    <binary>carosello</binary>
+    <mediatype>image/jpeg</mediatype>
+    <mediatype>image/png</mediatype>
+    <mediatype>image/webp</mediatype>
+    <mediatype>image/gif</mediatype>
+    <mediatype>image/bmp</mediatype>
+    <mediatype>image/tiff</mediatype>
+    <mediatype>video/mp4</mediatype>
+    <mediatype>video/webm</mediatype>
+    <mediatype>video/x-matroska</mediatype>
+  </provides>
   <url type="homepage">https://github.com/grigio/carosello</url>
   <url type="bugtracker">https://github.com/grigio/carosello/issues</url>
   <developer id="io.github.grigio.carosello">
@@ -30,11 +42,16 @@
   <content_rating type="oars-1.1" />
   <screenshots>
     <screenshot type="default">
-      <image>https://github.com/grigio/carosello/raw/master/carosello.png</image>
+      <image>https://github.com/grigio/carosello/raw/master/carosello.gif</image>
       <caption>Carosello viewing images with navigation controls</caption>
     </screenshot>
   </screenshots>
   <releases>
+    <release version="1.0.9" date="2026-09-22">
+      <description>
+        <p>Arch Linux packaging (PKGBUILD), full image/video file associations, and version sync between Cargo, Meson and AppStream.</p>
+      </description>
+    </release>
     <release version="1.0.8" date="2026-09-21">
       <description>
         <p>Slide animation between items (3-finger drag follows the finger), Preferences switch to disable it, sandboxed drag-and-drop of portal files and folders, and EXIF-orientation fix for transition frames.</p>

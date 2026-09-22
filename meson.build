@@ -1,6 +1,12 @@
 project(
   'carosello',
-  version: '1.0.6',
+  # Single source of truth is Cargo.toml; build-aux/cargo-version.py reads it.
+  version: run_command(
+    'python3',
+    files('build-aux/cargo-version.py'),
+    files('Cargo.toml'),
+    check: true,
+  ).stdout().strip(),
   meson_version: '>= 0.62.0',
   default_options: [
     'warning_level=2',
