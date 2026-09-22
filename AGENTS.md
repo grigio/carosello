@@ -32,8 +32,15 @@
   fallback). Verified: the portal exports a dropped folder's full subtree
   (12- and 64-photo sftp folders listed fine). `start_index` must handle
   `paths` being empty (folder-only drop).
+- **Flatpak has a private `/tmp`**: paths under `/tmp/…` are invisible
+  inside the sandbox (the app shows "No Images Found"). Test media must
+  live under `~/` (`host:rw`), or pass a real host path only if it is
+  outside `/tmp`.
 - No new crates / system deps without regenerating `cargo-sources.json`
   (CI regenerates it from `Cargo.lock`; keep the lockfile committed).
+  The file itself is **gitignored** — before a local `flatpak-builder`,
+  regenerate it with the Python snippet from `.github/workflows/ci.yml`
+  (tomllib reads `Cargo.lock`, emits archive+checksum entries).
 
 ## Versioning
 
@@ -70,4 +77,64 @@
   io.github.grigio.carosello.yml`
 - Smoke test headless, check stderr is empty (no panic, no GVFS warnings):
   `timeout 10 flatpak run io.github.grigio.carosello ~/Pictures/Screenshots`
-  plus a portal path under `/run/user/1000/doc/…`.
+  plus a portal path under `/run/user/1000/doc/…`. Run **without**
+  `CAROSELLO_DEBUG` for this check — the var prints `[carosello-debug]`
+  traces to stderr; use `CAROSELLO_DEBUG=1` separately to trace behavior
+  (collect/drop/display/transform decisions).
+
+## Transforms (rotate / mirror + autosave)
+
+- Three flat header buttons (`object-rotate-left/right-symbolic`,
+  `object-flip-horizontal-symbolic`), enabled only while showing a real
+  image with no save in flight (`sync_transform_buttons`: video / empty
+  folder / `state.saving` ⇒ disabled). **`AdwHeaderBar::pack_end`
+  prepends** — pack order is the exact reverse of the wanted look; the
+  pack block in `window.rs` documents the contract (visual order
+  `[rotL][rotR][mirror][⊖][fit][⊕][≡]`).
+- Pipeline = `src/transform.rs` (pure, unit-tested, Send-only data):
+  decode → EXIF-orient → transform → encode. `image::imageops::rotate90`
+  is **clockwise** (used for RotateRight). Saved pixels are
+  display-oriented and the JPEG APP1 Orientation is patched back to `1`
+  (thumbnail/IFD1 dropped) so a reload never double-rotates. JPEG
+  re-encodes at q95 ⇒ bytes change even for an identity pair (R then L).
+  Animated GIF/WebP are refused (`reject_animation`); videos never reach
+  the pipeline (button disabled).
+- Worker → main bridge: glib 0.20 has no `MainContext::channel` and
+  `idle_add` needs `Send`, so the worker stores
+  `Arc<Mutex<Option<Result<(Vec<u8>, Option<Permissions)>, String>>>>`
+  and a `glib::timeout_add_local(Duration::from_millis(16), …)` poller
+  takes it (signature: `(Duration, FnMut() -> ControlFlow)`), with a
+  ~30 s / 1875-tick deadline. `glib` is **not a direct dependency** —
+  reference it as `gtk::glib` (also in `transform.rs` tests).
+- The write stays on the main context: `gio::File::replace_contents_async`
+  (callback `Ok((contents, etag))` / `Err((contents, error))`, Rc captures
+  fine). The atomic replace **resets file mode** — restore the
+  `std::fs::Permissions` captured before the write. Failures are toasts
+  (`Cannot read …` worker-side, `Cannot save …` write-side + portal hint
+  via `is_doc_portal_path`).
+- While `state.saving`: `trash_current` refuses (would recreate a trashed
+  file at its old path) and `prefetch_neighbors` early-returns (a decode
+  racing the replace could cache pre-transform pixels). On success: drop
+  the stale `prefetch` entry, re-enable buttons, re-run `show_image()`
+  only if the path is still the current index.
+
+## GUI automation (interactive tests on this machine)
+
+- `ydotoold` already runs in the user session:
+  `export YDOTOOL_SOCKET=/run/user/1000/.ydotool_socket`.
+  **`ydotool click 0x00` is a documented no-op — a real left click is
+  `ydotool click 0xC0`** (0x40=down, 0x80=up). `mousemove` requires
+  `-x/-y` flags; positional args print usage.
+- grim captures the buffer at **3120×2080 with output scale 2.0** ⇒
+  Wayland pointer/logical coords = grim pixels ÷ 2. Use `grim -c` (adds
+  the cursor) and **close the loop with screenshots before every click**:
+  synthetic relative moves overshoot ~15 % (libinput accel), so computed
+  positions drift.
+- Revealing Carosello's header: move into the **top (or bottom) 25 % of
+  the window** (it hides again 3 s after motion outside those zones). The
+  hovered button shows a grey pill — diffing it against a no-hover
+  baseline PNG (grey rows where baseline is black) identifies the target
+  button exactly; its center is the *button* center, not the cursor.
+- `wtype -k Left` sends keys (window must be focused). Kill the app with
+  `pkill -x carosello` — `pkill -f <path/pattern>` also matches your own
+  shell's command line and kills the test script mid-flight.
