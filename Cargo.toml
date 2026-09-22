@@ -14,6 +14,14 @@ gtk = { package = "gtk4", version = "0.9", features = ["gnome_45"] }
 gdk-pixbuf = { package = "gdk-pixbuf", version = "0.20" }
 libadwaita = { version = "0.7", features = ["v1_5"] }
 kamadak-exif = "0.6"
+image = { version = "0.25", default-features = false, features = [
+    "bmp",
+    "gif",
+    "jpeg",
+    "png",
+    "tiff",
+    "webp",
+] }
 
 [profile.release]
 lto = true

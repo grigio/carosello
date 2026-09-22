@@ -2,6 +2,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use adw::prelude::*;
@@ -13,6 +14,7 @@ use libadwaita as adw;
 use crate::css;
 use crate::media;
 use crate::state::{self, debug_log, format_time, is_media};
+use crate::transform;
 use crate::zoom::{self, ZoomPaintable};
 
 struct AppState {
@@ -59,6 +61,12 @@ struct AppState {
     /// User pref: two-finger swipe navigates (instead of three-finger).
     /// Off by default; touchpad drags and discrete swipes gate on it.
     two_finger_swipe: bool,
+    /// Rotate/mirror header buttons: kept here to enable/disable them
+    /// (disabled for videos, empty folder, and while a save is in flight).
+    transform_btns: Vec<gtk::Button>,
+    /// A transform is being computed or written to disk; blocks new
+    /// transforms and Move to Trash until the write completes.
+    saving: bool,
 }
 
 /// One interactive swipe drag: the outgoing frame plus the incoming
@@ -137,6 +145,8 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
         drag: None,
         slide_enabled: state::load_slide_enabled(),
         two_finger_swipe: state::load_two_finger_swipe(),
+        transform_btns: Vec::new(),
+        saving: false,
     }));
 
     let mut start_index: usize = 0;
@@ -235,7 +245,70 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
     }
     header_bar.pack_start(&fullscreen_btn);
 
-    // ── Top-right: zoom + menu ──
+    // ── Top-right: transforms, zoom + menu (visual order, left → right) ──
+    // NOTE: AdwHeaderBar::pack_end PREPENDS to the end box, so the final
+    // look is the reverse of the packing order. Widgets are created here in
+    // visual order and packed in reverse at the end of this section, so the
+    // header reads [rotate-left][rotate-right][mirror][zoom-out]
+    // [zoom-reset][zoom-in][menu][window controls].
+    let rotate_left_btn = gtk::Button::builder()
+        .icon_name("object-rotate-left-symbolic")
+        .tooltip_text("Rotate Left")
+        .css_classes(["flat"])
+        .build();
+    rotate_left_btn.update_property(&[gtk::accessible::Property::Label("Rotate Left")]);
+    rotate_left_btn.set_accessible_role(gtk::AccessibleRole::Button);
+    {
+        let state = state.clone();
+        let picture = picture.clone();
+        let scrolled = scrolled.clone();
+        rotate_left_btn.connect_clicked(move |_| {
+            run_transform(
+                &state,
+                &picture,
+                &scrolled,
+                transform::Transform::RotateLeft,
+            );
+        });
+    }
+
+    let rotate_right_btn = gtk::Button::builder()
+        .icon_name("object-rotate-right-symbolic")
+        .tooltip_text("Rotate Right")
+        .css_classes(["flat"])
+        .build();
+    rotate_right_btn.update_property(&[gtk::accessible::Property::Label("Rotate Right")]);
+    rotate_right_btn.set_accessible_role(gtk::AccessibleRole::Button);
+    {
+        let state = state.clone();
+        let picture = picture.clone();
+        let scrolled = scrolled.clone();
+        rotate_right_btn.connect_clicked(move |_| {
+            run_transform(
+                &state,
+                &picture,
+                &scrolled,
+                transform::Transform::RotateRight,
+            );
+        });
+    }
+
+    let mirror_btn = gtk::Button::builder()
+        .icon_name("object-flip-horizontal-symbolic")
+        .tooltip_text("Mirror Horizontally")
+        .css_classes(["flat"])
+        .build();
+    mirror_btn.update_property(&[gtk::accessible::Property::Label("Mirror Horizontally")]);
+    mirror_btn.set_accessible_role(gtk::AccessibleRole::Button);
+    {
+        let state = state.clone();
+        let picture = picture.clone();
+        let scrolled = scrolled.clone();
+        mirror_btn.connect_clicked(move |_| {
+            run_transform(&state, &picture, &scrolled, transform::Transform::MirrorH);
+        });
+    }
+
     let zoom_out_btn = gtk::Button::builder()
         .icon_name("zoom-out-symbolic")
         .tooltip_text("Zoom Out (Ctrl+-)")
@@ -251,7 +324,6 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
             zoom_by(&state, &picture, &scrolled, 1.0 / 1.25, None);
         });
     }
-    header_bar.pack_end(&zoom_out_btn);
 
     let zoom_reset_btn = gtk::Button::builder()
         .icon_name("zoom-fit-best-symbolic")
@@ -268,7 +340,6 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
             zoom_to(&state, &picture, &scrolled, 1.0, None);
         });
     }
-    header_bar.pack_end(&zoom_reset_btn);
 
     let zoom_in_btn = gtk::Button::builder()
         .icon_name("zoom-in-symbolic")
@@ -285,7 +356,6 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
             zoom_by(&state, &picture, &scrolled, 1.25, None);
         });
     }
-    header_bar.pack_end(&zoom_in_btn);
 
     let section = gio::Menu::new();
     section.append(Some("Open…"), Some("win.open"));
@@ -305,7 +375,24 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
         .tooltip_text("Menu (F10)")
         .css_classes(["flat"])
         .build();
+
+    // Transform buttons live in state so sync_transform_buttons() can flip
+    // their sensitivity (video / empty folder / save in flight).
+    state.borrow_mut().transform_btns = vec![
+        rotate_left_btn.clone(),
+        rotate_right_btn.clone(),
+        mirror_btn.clone(),
+    ];
+
+    // Pack in REVERSE visual order (pack_end prepends to the end box, and
+    // the window controls are appended by libadwaita last).
     header_bar.pack_end(&menu_btn);
+    header_bar.pack_end(&zoom_in_btn);
+    header_bar.pack_end(&zoom_reset_btn);
+    header_bar.pack_end(&zoom_out_btn);
+    header_bar.pack_end(&mirror_btn);
+    header_bar.pack_end(&rotate_right_btn);
+    header_bar.pack_end(&rotate_left_btn);
 
     // Wrap the header bar in a WindowHandle for drag support (overlay, transparent, no push)
     let top_handle = gtk::WindowHandle::new();
@@ -966,6 +1053,10 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
     if has_files {
         state.borrow_mut().index = start_index;
         show_file(&state, &picture, &scrolled, &window);
+    } else {
+        // Transform buttons start disabled in an empty folder (show_file
+        // only runs when there is a file).
+        sync_transform_buttons(&state);
     }
 
     // ── Keyboard (GNOME HIG standard shortcuts) ──
@@ -3038,6 +3129,12 @@ fn trash_current(
     scrolled: &gtk::ScrolledWindow,
     window: &adw::ApplicationWindow,
 ) {
+    // An in-flight transform write would recreate a trashed file at its old
+    // path (GIO replace works on the original path), so make people wait.
+    if state.borrow().saving {
+        show_toast(state, "Wait for the save to finish first");
+        return;
+    }
     let path = {
         let s = state.borrow();
         if s.files.is_empty() {
@@ -3087,6 +3184,188 @@ fn trash_current(
     }
 }
 
+/// Worker result of a transform: encoded bytes plus the original file mode
+/// (GIO's atomic replace recreates the file, so permissions are restored).
+type TransformResult = Result<(Vec<u8>, Option<std::fs::Permissions>), String>;
+
+/// Transform buttons are enabled only while showing a real image with no
+/// save in flight (disabled for videos, empty folder, and mid-save).
+fn sync_transform_buttons(state: &Rc<RefCell<AppState>>) {
+    let (buttons, enabled) = {
+        let s = state.borrow();
+        (
+            s.transform_btns.clone(),
+            !s.files.is_empty() && !s.is_video && !s.saving,
+        )
+    };
+    for btn in buttons {
+        btn.set_sensitive(enabled);
+    }
+}
+
+/// Rotate/mirror the current image and autosave it in place.
+///
+/// Read/decode/transform/encode happens on a worker thread using only Send
+/// data (no Pixbuf, no Rc — AGENTS.md); the result comes back through an
+/// `Arc<Mutex<…>>` slot polled on the main context (glib has no channel
+/// and `idle_add` closures must be Send). The file write itself is GIO
+/// async, so gvfs/portal paths keep working.
+fn run_transform(
+    state: &Rc<RefCell<AppState>>,
+    picture: &gtk::Picture,
+    scrolled: &gtk::ScrolledWindow,
+    op: transform::Transform,
+) {
+    let path = {
+        let s = state.borrow();
+        if s.files.is_empty() || s.is_video || s.saving {
+            return;
+        }
+        s.files[s.index].clone()
+    };
+    debug_log(&format!("transform: {op:?} {}", path.display()));
+    cancel_slide(state);
+    {
+        let mut s = state.borrow_mut();
+        s.saving = true;
+    }
+    sync_transform_buttons(state);
+
+    let slot: Arc<Mutex<Option<TransformResult>>> = Arc::new(Mutex::new(None));
+    {
+        let slot = slot.clone();
+        let worker_path = path.clone();
+        std::thread::spawn(move || {
+            let result = (|| -> TransformResult {
+                let mode = std::fs::metadata(&worker_path)
+                    .ok()
+                    .map(|m| m.permissions());
+                let bytes = std::fs::read(&worker_path)
+                    .map_err(|e| format!("Cannot read {}: {e}", worker_path.display()))?;
+                let ext = worker_path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or_default();
+                let out = transform::transform_bytes(&bytes, ext, op)?;
+                Ok((out, mode))
+            })();
+            if let Ok(mut guard) = slot.lock() {
+                *guard = Some(result);
+            }
+        });
+    }
+
+    // Poll the slot every frame; ~30 s safety net if the worker never
+    // reports back (in release a worker panic aborts the process anyway).
+    let state_c = state.clone();
+    let picture_c = picture.clone();
+    let scrolled_c = scrolled.clone();
+    let path_c = path.clone();
+    let mut ticks: u32 = 0;
+    glib::timeout_add_local(Duration::from_millis(16), move || {
+        let taken = match slot.lock() {
+            Ok(mut guard) => guard.take(),
+            Err(_) => None,
+        };
+        if let Some(result) = taken {
+            finish_transform(&state_c, &picture_c, &scrolled_c, &path_c, result);
+            return glib::ControlFlow::Break;
+        }
+        ticks += 1;
+        if ticks >= 1_875 {
+            debug_log("transform: worker never reported back, giving up");
+            show_toast(&state_c, "Transform timed out");
+            state_c.borrow_mut().saving = false;
+            sync_transform_buttons(&state_c);
+            return glib::ControlFlow::Break;
+        }
+        glib::ControlFlow::Continue
+    });
+}
+
+/// Worker finished: write the result over the original file (GIO async,
+/// then restore permissions), refresh the view if it is still current.
+fn finish_transform(
+    state: &Rc<RefCell<AppState>>,
+    picture: &gtk::Picture,
+    scrolled: &gtk::ScrolledWindow,
+    path: &Path,
+    result: TransformResult,
+) {
+    let (bytes, mode) = match result {
+        Ok(ok) => ok,
+        Err(msg) => {
+            debug_log(&format!("transform failed for {}: {msg}", path.display()));
+            let hint = if is_doc_portal_path(path) {
+                " — use Open Folder so the file is writable"
+            } else {
+                ""
+            };
+            show_toast(state, &format!("{msg}{hint}"));
+            state.borrow_mut().saving = false;
+            sync_transform_buttons(state);
+            return;
+        }
+    };
+
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file")
+        .to_string();
+    let file = gio::File::for_path(path);
+    let state_c = state.clone();
+    let picture_c = picture.clone();
+    let scrolled_c = scrolled.clone();
+    let path_c = path.to_path_buf();
+    file.replace_contents_async(
+        bytes,
+        None,
+        false,
+        gio::FileCreateFlags::NONE,
+        None::<&gio::Cancellable>,
+        move |res| {
+            match res {
+                Ok(_) => {
+                    debug_log(&format!("transform: saved {}", path_c.display()));
+                    // GIO replaced the file: put the original mode back.
+                    if let Some(mode) = mode {
+                        let _ = std::fs::set_permissions(&path_c, mode);
+                    }
+                    {
+                        let mut s = state_c.borrow_mut();
+                        s.saving = false;
+                        // Drop pixels decoded from the pre-transform file.
+                        s.prefetch.remove(&path_c);
+                    }
+                    sync_transform_buttons(&state_c);
+                    // Refresh only if this file is still on screen.
+                    let current = {
+                        let s = state_c.borrow();
+                        s.files.get(s.index).cloned()
+                    };
+                    if current.as_deref() == Some(path_c.as_path()) {
+                        show_image(&state_c, &picture_c, &scrolled_c, &path_c);
+                    }
+                }
+                Err((_, e)) => {
+                    debug_log(&format!("transform: save failed for {}: {e}", path_c.display()));
+                    if is_doc_portal_path(&path_c) {
+                        show_toast(
+                            &state_c,
+                            "Cannot save to sandbox portal — use Open Folder so the file is writable",
+                        );
+                    } else {
+                        show_toast(&state_c, &format!("Cannot save {name}"));
+                    }
+                    state_c.borrow_mut().saving = false;
+                    sync_transform_buttons(&state_c);
+                }
+            }
+        },
+    );
+}
+
 fn show_file(
     state: &Rc<RefCell<AppState>>,
     picture: &gtk::Picture,
@@ -3106,6 +3385,7 @@ fn show_file(
                 wt.set_title("Carosello");
                 wt.set_subtitle("");
             }
+            sync_transform_buttons(state);
             return;
         }
         (s.files[s.index].clone(), s.index, s.files.len())
@@ -3143,6 +3423,9 @@ fn show_file(
     } else {
         show_image(state, picture, scrolled, &path);
     }
+
+    // After dispatch, so is_video reflects the item just shown.
+    sync_transform_buttons(state);
 }
 
 fn show_image(
@@ -3277,6 +3560,12 @@ fn show_image(
 /// Decode next/prev images in the background so navigation feels instant.
 /// Bounded to 2 entries; GIO-async so the UI never blocks.
 fn prefetch_neighbors(state: &Rc<RefCell<AppState>>) {
+    // While a transform save is in flight, a decode started now could land
+    // around the atomic replace and cache pre-transform pixels. Navigation
+    // just falls back to a normal async load instead.
+    if state.borrow().saving {
+        return;
+    }
     let (files, index) = {
         let s = state.borrow();
         (s.files.clone(), s.index)
