@@ -118,6 +118,16 @@
   the stale `prefetch` entry, re-enable buttons, re-run `show_image()`
   only if the path is still the current index.
 
+## Zoom anchor
+
+- `GestureClick::pressed` x/y are **per-device** on Wayland while the pointer
+  cursor is shared: clicking with a device that hasn't moved (touchpad after
+  mouse, or vice versa) reports stale/`(0,0)` coords and the zoom lands
+  top-left. When `device.has_cursor()`, anchor on the motion-tracked
+  `mouse_x/mouse_y` (overlay coords == viewport coords, same as the pinch
+  path); touch (no cursor) keeps event coords + `compute_point`. Diagnose
+  with `CAROSELLO_DEBUG=1`: the `dblclick: press=… cursor=…` line shows both.
+
 ## GUI automation (interactive tests on this machine)
 
 - `ydotoold` already runs in the user session:
