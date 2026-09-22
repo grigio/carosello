@@ -5,7 +5,7 @@
 # Or with an AUR helper: yay -S carosello  /  paru -S carosello
 
 pkgname=carosello
-pkgver=1.1.0
+pkgver=1.2.0
 pkgrel=1
 pkgdesc="A fast, minimalist image and video viewer for Linux (GTK4/libadwaita)"
 arch=('x86_64' 'aarch64')

@@ -47,6 +47,11 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="1.2.0" date="2026-09-23">
+      <description>
+        <p>Rotate/mirror tools with in-place autosave, an optional two-finger swipe navigation gesture, double-click zoom anchored at the cursor, faster worker-thread image decoding with cancellable prefetching, and a Flatpak now built on the GNOME 51 runtime.</p>
+      </description>
+    </release>
     <release version="1.1.0" date="2026-09-22">
       <description>
         <p>Arch Linux packaging (PKGBUILD/AUR), full image/video file associations, and single-source versioning across Cargo, Meson, Flatpak and Arch.</p>

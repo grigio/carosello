@@ -1,6 +1,6 @@
 pkgbase = carosello
 	pkgdesc = A fast, minimalist image and video viewer for Linux (GTK4/libadwaita)
-	pkgver = 1.1.0
+	pkgver = 1.2.0
 	pkgrel = 1
 	url = https://github.com/grigio/carosello
 	arch = x86_64
@@ -20,7 +20,7 @@ pkgbase = carosello
 	optdepends = gst-plugins-bad: extra video codecs (mkv)
 	optdepends = gst-plugins-ugly: extra video codecs
 	optdepends = gst-libav: ffmpeg-based codecs
-	source = carosello-1.1.0.tar.gz::https://github.com/grigio/carosello/archive/refs/tags/v1.1.0.tar.gz
+	source = carosello-1.2.0.tar.gz::https://github.com/grigio/carosello/archive/refs/tags/v1.2.0.tar.gz
 	sha256sums = SKIP
 
 pkgname = carosello
