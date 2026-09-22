@@ -47,8 +47,11 @@ Without a helper:
 ```bash
 git clone https://github.com/grigio/carosello.git
 cd carosello
-makepkg -si
+BUILDDIR=/tmp/makepkg makepkg -si
 ```
+
+(`BUILDDIR` keeps makepkg's `src/`/`pkg/` scratch dirs out of the repo
+tree, which already contains a tracked `src/`.)
 
 The `PKGBUILD` builds with Meson + Cargo (`arch-meson build && meson compile -C build`)
 and installs the binary, desktop entry, AppStream metadata, and icons.
