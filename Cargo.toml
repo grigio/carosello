@@ -10,9 +10,8 @@ keywords = ["image", "video", "viewer", "gtk", "gnome"]
 categories = ["gui", "multimedia"]
 
 [dependencies]
-gtk = { package = "gtk4", version = "0.9", features = ["gnome_45"] }
-gdk-pixbuf = { package = "gdk-pixbuf", version = "0.20" }
-libadwaita = { version = "0.7", features = ["v1_5"] }
+gtk = { package = "gtk4", version = "0.9", features = ["v4_14"] }
+libadwaita = { version = "0.7", features = ["v1_6"] }
 kamadak-exif = "0.6"
 image = { version = "0.25", default-features = false, features = [
     "bmp",
@@ -27,6 +26,10 @@ image = { version = "0.25", default-features = false, features = [
 lto = true
 strip = true
 panic = "abort"
+# One CGU: max inlining across the crate (marginal but free speed; the
+# build is CI-precompiled anyway — IMPROVEMENTS #5).
+codegen-units = 1
+opt-level = 3
 
 [lints.clippy]
 pedantic = { level = "allow", priority = 0 }

@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -12,7 +12,6 @@ use gtk::glib;
 use libadwaita as adw;
 
 use crate::css;
-use crate::media;
 use crate::state::{self, debug_log, format_time, is_media};
 use crate::transform;
 use crate::zoom::{self, ZoomPaintable};
@@ -20,11 +19,19 @@ use crate::zoom::{self, ZoomPaintable};
 struct AppState {
     files: Vec<PathBuf>,
     index: usize,
-    original_pixbuf: Option<gdk_pixbuf::Pixbuf>,
     image_w: i32,
     image_h: i32,
     image_gen: u64,
-    prefetch: HashMap<PathBuf, gdk_pixbuf::Pixbuf>,
+    /// FIFO of decoded neighbor frames (path, texture), oldest first,
+    /// capped at 2 — see `prefetch_*` below. Textures, not pixbufs: the
+    /// slide/drag paths and the main view all render the same GPU copy
+    /// (report #4 used to upload each frame twice).
+    prefetch: VecDeque<(PathBuf, gdk::Texture)>,
+    /// Cancels the in-flight display decode (replaced on every
+    /// `show_image`/`show_video`, after the `image_gen` bump).
+    decode_cancel: Option<gio::Cancellable>,
+    /// Cancels the current prefetch round (one round per navigation).
+    prefetch_cancel: Option<gio::Cancellable>,
     zoom: f64,
     media_file: Option<gtk::MediaFile>,
     video_view: ZoomPaintable,
@@ -37,6 +44,12 @@ struct AppState {
     video_h: i32,
     mouse_x: f64,
     mouse_y: f64,
+    /// Whether the pointer position above was ever observed (`motion` or
+    /// `enter` on the overlay). Distinguishes "cursor at (0,0)" from "never
+    /// seen": a window opening under a stationary cursor plus a tap-to-click
+    /// double-tap delivers no motion at all, and an unseen (0,0) must never
+    /// be used as a zoom anchor (it scrolls to the top-left corner).
+    mouse_seen: bool,
     play_pause_btn: Option<gtk::Button>,
     mute_btn: Option<gtk::Button>,
     seek_scale: Option<gtk::Scale>,
@@ -67,6 +80,17 @@ struct AppState {
     /// A transform is being computed or written to disk; blocks new
     /// transforms and Move to Trash until the write completes.
     saving: bool,
+    /// A `trash_async` request is in flight (blocks a second one).
+    trashing: bool,
+    /// Last state pushed to the seek bar/labels — `(ts_s, dur_s, bar_unit,
+    /// playing, seeking)`; `update_seek_ui` early-outs when unchanged
+    /// (report #9). `bar_unit = ts * 500 / dur` = the seek bar's own
+    /// granularity, so the handle still moves smoothly at pixel steps.
+    last_seek_ui: Option<(i64, i64, i64, bool, bool)>,
+    /// Last layout `update_display` applied — `(dw, dh, is_video, fit_w,
+    /// fit_h, zoom)`; skip re-setting identical `content_fit` /
+    /// `size_request` / view values (report: lower-impact polish).
+    last_layout: Option<(i32, i32, bool, f64, f64, f64)>,
 }
 
 /// One interactive swipe drag: the outgoing frame plus the incoming
@@ -104,17 +128,65 @@ struct DragSt {
     gen: u64,
 }
 
+impl AppState {
+    /// Borrowed texture clone for a cached neighbor (slide/drag *peek*:
+    /// the entry stays for `prefetch_take` in the main view).
+    fn prefetch_get(&self, path: &Path) -> Option<gdk::Texture> {
+        self.prefetch
+            .iter()
+            .find(|(p, _)| p.as_path() == path)
+            .map(|(_, t)| t.clone())
+    }
+
+    fn prefetch_contains(&self, path: &Path) -> bool {
+        self.prefetch.iter().any(|(p, _)| p.as_path() == path)
+    }
+
+    /// Consume the cached neighbor (the main view takes it for itself).
+    fn prefetch_take(&mut self, path: &Path) -> Option<gdk::Texture> {
+        let pos = self
+            .prefetch
+            .iter()
+            .position(|(p, _)| p.as_path() == path)?;
+        self.prefetch.remove(pos).map(|(_, t)| t)
+    }
+
+    /// Drop a cached neighbor (file trashed / transformed since decode).
+    fn prefetch_drop(&mut self, path: &Path) {
+        if let Some(pos) = self.prefetch.iter().position(|(p, _)| p.as_path() == path) {
+            self.prefetch.remove(pos);
+        }
+    }
+
+    /// Store a decoded neighbor, evicting the oldest first (FIFO — with
+    /// only 2 slots an arbitrary key could evict the fresh true neighbor,
+    /// report #3.3).
+    fn prefetch_store(&mut self, path: &Path, tex: gdk::Texture) {
+        if self.prefetch_contains(path) {
+            return;
+        }
+        while self.prefetch.len() >= 2 {
+            self.prefetch.pop_front();
+        }
+        self.prefetch.push_back((path.to_path_buf(), tex));
+    }
+}
+
 pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWindow {
     css::load_css();
+
+    // Both prefs from a single settings read (report #8: was two reads).
+    let (slide_enabled, two_finger_swipe) = state::load_prefs();
 
     let state: Rc<RefCell<AppState>> = Rc::new(RefCell::new(AppState {
         files: Vec::new(),
         index: 0,
-        original_pixbuf: None,
         image_w: 0,
         image_h: 0,
         image_gen: 0,
-        prefetch: HashMap::new(),
+        prefetch: VecDeque::new(),
+        decode_cancel: None,
+        prefetch_cancel: None,
         zoom: 1.0,
         media_file: None,
         video_view: ZoomPaintable::new(),
@@ -127,6 +199,7 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
         video_h: 0,
         mouse_x: 0.0,
         mouse_y: 0.0,
+        mouse_seen: false,
         play_pause_btn: None,
         mute_btn: None,
         seek_scale: None,
@@ -143,10 +216,13 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
         sliding: false,
         last_drag_us: 0,
         drag: None,
-        slide_enabled: state::load_slide_enabled(),
-        two_finger_swipe: state::load_two_finger_swipe(),
+        slide_enabled,
+        two_finger_swipe,
         transform_btns: Vec::new(),
         saving: false,
+        trashing: false,
+        last_seek_ui: None,
+        last_layout: None,
     }));
 
     let mut start_index: usize = 0;
@@ -337,7 +413,7 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
         let picture = picture.clone();
         let scrolled = scrolled.clone();
         zoom_reset_btn.connect_clicked(move |_| {
-            debug_log("zoom-reset: button");
+            debug_log!("zoom-reset: button");
             zoom_to(&state, &picture, &scrolled, 1.0, None);
         });
     }
@@ -615,12 +691,15 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
         let top = top_handle.clone();
         let bottom = bottom_outer.clone();
         let hide_id: Rc<Cell<Option<glib::SourceId>>> = Rc::new(Cell::new(None));
+        // Monotonic µs when `hide_id` was last armed (report #7 throttle).
+        let hide_armed_us: Rc<Cell<i64>> = Rc::new(Cell::new(0));
 
         let motion_ctrl = gtk::EventControllerMotion::new();
         {
             let top = top.clone();
             let bottom = bottom.clone();
             let hide_id = hide_id.clone();
+            let hide_armed_us = hide_armed_us.clone();
             let state = state.clone();
             let window_ref = window.clone();
             let menu = menu_btn.clone();
@@ -629,6 +708,7 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
                     let mut s = state.borrow_mut();
                     s.mouse_x = x;
                     s.mouse_y = y;
+                    s.mouse_seen = true;
                 }
                 let win_h = window_ref.height() as f64;
                 let at_top = y < win_h * EDGE_THRESHOLD;
@@ -644,8 +724,28 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
                     }
                 }
                 if !in_top_zone && !in_bottom_zone {
-                    arm_hide(&top, &bottom, &hide_id, FADE_DELAY_MS, &menu);
+                    arm_hide(
+                        &top,
+                        &bottom,
+                        &hide_id,
+                        &hide_armed_us,
+                        FADE_DELAY_MS,
+                        &menu,
+                    );
                 }
+            });
+        }
+        // `enter` must record the cursor too: a window that opens under a
+        // stationary cursor (or a tap-to-click double-tap, which generates
+        // no motion) only ever delivers `enter`. Without this, mouse_x/mouse_y
+        // stayed (0,0) and the double-click/pinch anchor landed top-left.
+        {
+            let state = state.clone();
+            motion_ctrl.connect_enter(move |_, x, y| {
+                let mut s = state.borrow_mut();
+                s.mouse_x = x;
+                s.mouse_y = y;
+                s.mouse_seen = true;
             });
         }
         overlay.add_controller(motion_ctrl);
@@ -673,9 +773,17 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
                 let top = top.clone();
                 let bottom = bottom_outer.clone();
                 let hide_id = hide_id.clone();
+                let hide_armed_us = hide_armed_us.clone();
                 let menu = menu_btn.clone();
                 motion_top.connect_leave(move |_| {
-                    arm_hide(&top, &bottom, &hide_id, FADE_DELAY_MS, &menu);
+                    arm_hide(
+                        &top,
+                        &bottom,
+                        &hide_id,
+                        &hide_armed_us,
+                        FADE_DELAY_MS,
+                        &menu,
+                    );
                 });
             }
             top_handle.add_controller(motion_top);
@@ -702,9 +810,17 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
                 let bottom = bottom.clone();
                 let top = top_handle.clone();
                 let hide_id = hide_id.clone();
+                let hide_armed_us = hide_armed_us.clone();
                 let menu = menu_btn.clone();
                 motion_bottom.connect_leave(move |_| {
-                    arm_hide(&top, &bottom, &hide_id, FADE_DELAY_MS, &menu);
+                    arm_hide(
+                        &top,
+                        &bottom,
+                        &hide_id,
+                        &hide_armed_us,
+                        FADE_DELAY_MS,
+                        &menu,
+                    );
                 });
             }
             bottom_outer.add_controller(motion_bottom);
@@ -715,6 +831,7 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
             let top = top_handle.clone();
             let bottom = bottom_outer.clone();
             let hide_id = hide_id.clone();
+            let hide_armed_us = hide_armed_us.clone();
             menu_btn.connect_active_notify(move |btn| {
                 if btn.is_active() {
                     cancel_hide(&hide_id);
@@ -723,7 +840,7 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
                         bottom.set_opacity(1.0);
                     }
                 } else {
-                    arm_hide(&top, &bottom, &hide_id, FADE_DELAY_MS, btn);
+                    arm_hide(&top, &bottom, &hide_id, &hide_armed_us, FADE_DELAY_MS, btn);
                 }
             });
         }
@@ -757,7 +874,7 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
             if let Ok(file_list) = value.get::<gdk::FileList>() {
                 let gfiles = file_list.files();
                 if let Some(first) = gfiles.first() {
-                    debug_log(&format!(
+                    debug_log!(format!(
                         "drop: uri={} has_local_path={}",
                         first.uri(),
                         first.path().is_some()
@@ -1027,7 +1144,7 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
         let scrolled = scrolled.clone();
         let zoom_reset = gio::SimpleAction::new("zoom-reset", None);
         zoom_reset.connect_activate(move |_, _| {
-            debug_log("zoom-reset: accel action");
+            debug_log!("zoom-reset: accel action");
             zoom_to(&state, &picture, &scrolled, 1.0, None);
         });
         window.add_action(&zoom_reset);
@@ -1129,14 +1246,14 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
                 glib::Propagation::Stop
             }
             gdk::Key::_0 | gdk::Key::KP_0 if modifier.contains(gdk::ModifierType::CONTROL_MASK) => {
-                debug_log("zoom-reset: key Ctrl+0");
+                debug_log!("zoom-reset: key Ctrl+0");
                 zoom_to(&state, &picture, &scrolled, 1.0, None);
                 glib::Propagation::Stop
             }
             gdk::Key::Escape => {
                 let z = state.borrow().zoom;
                 if (z - 1.0).abs() > 0.01 {
-                    debug_log("zoom-reset: key Escape");
+                    debug_log!("zoom-reset: key Escape");
                     zoom_to(&state, &picture, &scrolled, 1.0, None);
                     glib::Propagation::Stop
                 } else {
@@ -1257,7 +1374,7 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
                     id.remove();
                 }
                 if state.borrow().drag.is_some() {
-                    debug_log("scroll-swipe: settle");
+                    debug_log!("scroll-swipe: settle");
                     drag_end(&state, &picture, &scrolled, &window, false);
                 }
             })
@@ -1327,7 +1444,7 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
                     glib::Propagation::Stop
                 )
             {
-                debug_log(&format!("scroll-swipe: begin (dx={dx:.1})"));
+                debug_log!(format!("scroll-swipe: begin (dx={dx:.1})"));
             }
             if state.borrow().drag.is_none() {
                 // Begin declined (no frame, animations off…): stay out.
@@ -1402,15 +1519,24 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
             let base_zoom = base_zoom.clone();
             zoom_gesture.connect_scale_changed(move |gesture, scale| {
                 let target = (base_zoom.get() * scale).clamp(state::ZOOM_MIN, state::ZOOM_MAX);
-                debug_log(&format!(
+                debug_log!(format!(
                     "pinch: base={:.2} scale={scale:.3} -> target={target:.2}",
                     base_zoom.get()
                 ));
-                let anchor = if gesture.device().is_some_and(|d| d.has_cursor()) {
+                let (mx, my, seen) = {
                     let s = state.borrow();
-                    Some((s.mouse_x, s.mouse_y))
+                    (s.mouse_x, s.mouse_y, s.mouse_seen)
+                };
+                // (0,0) is the stale/never-seen marker for either source (see
+                // the double-click handler): prefer the source that is sane
+                // for this device kind, fall back to the other one.
+                let sane = |p: (f64, f64)| !(p.0 == 0.0 && p.1 == 0.0);
+                let cursor = seen.then_some((mx, my)).filter(|p| sane(*p));
+                let point = gesture.point(None).filter(|p| sane(*p));
+                let anchor = if gesture.device().is_some_and(|d| d.has_cursor()) {
+                    cursor.or(point)
                 } else {
-                    gesture.point(None)
+                    point.or(cursor)
                 };
                 zoom_to(&state, &picture, &scrolled, target, anchor);
             });
@@ -1471,61 +1597,73 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
         let picture_c = picture.clone();
         let scrolled_c = scrolled.clone();
         click.connect_pressed(move |gesture, n_press, x, y| {
-            if n_press == 2 {
-                let cur = state.borrow().zoom;
-                if cur > 1.5 {
-                    debug_log(&format!("dblclick-toggle: fit (cur={cur:.2})"));
-                    zoom_to(&state, &picture_c, &scrolled_c, 1.0, None);
-                } else if gesture.device().is_some_and(|d| d.has_cursor()) {
-                    // Pointer (mouse/touchpad) shares one cursor across devices,
-                    // but the press coordinates are per-device: clicking with a
-                    // device that hasn't moved since startup (or since the last
-                    // move with the *other* device) reports (0,0) and zooms
-                    // into the top-left. The motion tracker holds the live
-                    // cursor position (overlay == viewport coords, same as the
-                    // pinch path), so it stays correct either way.
-                    let (mx, my) = {
-                        let s = state.borrow();
-                        (s.mouse_x, s.mouse_y)
-                    };
-                    debug_log(&format!(
-                        "dblclick: press=({x:.0},{y:.0}) cursor=({mx:.0},{my:.0}) pic={}x{} scrolled={}x{}",
-                        picture_c.width(),
-                        picture_c.height(),
-                        scrolled_c.width(),
-                        scrolled_c.height()
-                    ));
-                    zoom_to(&state, &picture_c, &scrolled_c, 2.5, Some((mx, my)));
-                } else {
-                    let pt = gtk::graphene::Point::new(x as f32, y as f32);
-                    debug_log(&format!(
-                        "dblclick: press=({x:.0},{y:.0}) pic={}x{} scrolled={}x{}",
-                        picture_c.width(),
-                        picture_c.height(),
-                        scrolled_c.width(),
-                        scrolled_c.height()
-                    ));
-                    if let Some(conv) = picture_c.compute_point(&scrolled_c, &pt) {
-                        debug_log(&format!(
-                            "dblclick: anchor=({:.0},{:.0})",
-                            conv.x(),
-                            conv.y()
-                        ));
-                        zoom_to(
-                            &state,
-                            &picture_c,
-                            &scrolled_c,
-                            2.5,
-                            Some((conv.x() as f64, conv.y() as f64)),
-                        );
-                    } else {
-                        // Coordinate conversion can fail before first layout:
-                        // still zoom (centered) instead of ignoring the click.
-                        debug_log("dblclick: compute_point failed, center fallback");
-                        zoom_to(&state, &picture_c, &scrolled_c, 2.5, None);
-                    }
-                }
+            if n_press != 2 {
+                return;
             }
+            let cur = state.borrow().zoom;
+            if cur > 1.5 {
+                debug_log!(format!("dblclick-toggle: fit (cur={cur:.2})"));
+                zoom_to(&state, &picture_c, &scrolled_c, 1.0, None);
+                return;
+            }
+            // Two anchor sources, cross-checked:
+            //  - press coords (picture-local, converted to viewport space):
+            //    reliable for touch, but stale/`(0,0)` for a pointer device
+            //   that hasn't moved (documented Wayland per-device quirk);
+            //  - the motion/`enter`-tracked cursor: reliable for pointer
+            //    devices, but (0,0) until the pointer ever moves or enters —
+            //    a window opening under a stationary cursor followed by a
+            //    tap-to-click double-tap (no motion at all) used to zoom
+            //    into the top-left corner this way.
+            // Pick the source preferred for this device kind, reject (0,0) as
+            // the stale marker on either, use the other one, and only then
+            // fall back to the center — never to a corner. The log line shows
+            // both sources plus which won (CAROSELLO_DEBUG=1).
+            let has_cursor = gesture.device().is_some_and(|d| d.has_cursor());
+            let dev_name = gesture
+                .device()
+                .map(|d| d.name().to_string())
+                .unwrap_or_else(|| "<none>".into());
+            let (mx, my, seen) = {
+                let s = state.borrow();
+                (s.mouse_x, s.mouse_y, s.mouse_seen)
+            };
+            let press_vp = picture_c
+                .compute_point(&scrolled_c, &gtk::graphene::Point::new(x as f32, y as f32))
+                .map(|p| (p.x() as f64, p.y() as f64));
+            let sane = |p: (f64, f64)| !(p.0 == 0.0 && p.1 == 0.0);
+            let cursor = seen.then_some((mx, my)).filter(|p| sane(*p));
+            let press = press_vp.filter(|p| sane(*p));
+            let (anchor, src) = if has_cursor {
+                match (cursor, press) {
+                    (c @ Some(_), _) => (c, "cursor"),
+                    (_, p @ Some(_)) => (p, "press"),
+                    _ => (None, "center"),
+                }
+            } else {
+                match (press, cursor) {
+                    (p @ Some(_), _) => (p, "press"),
+                    (_, c @ Some(_)) => (c, "cursor"),
+                    _ => (None, "center"),
+                }
+            };
+            let fmt = |p: Option<(f64, f64)>| match p {
+                Some((a, b)) => format!("({a:.0},{b:.0})"),
+                None => "-".into(),
+            };
+            debug_log!(format!(
+                "dblclick: dev={dev_name} has_cursor={has_cursor} press=({x:.0},{y:.0})\u{2192}vp={} cursor=({mx:.0},{my:.0}) seen={seen} -> anchor {src} {} pic={}x{} scrolled={}x{}",
+                fmt(press_vp),
+                fmt(anchor),
+                picture_c.width(),
+                picture_c.height(),
+                scrolled_c.width(),
+                scrolled_c.height()
+            ));
+            // Coordinate conversion can fail before first layout: `anchor` is
+            // then None and the zoom still happens (centered), never silently
+            // dropped and never aimed at a corner.
+            zoom_to(&state, &picture_c, &scrolled_c, 2.5, anchor);
         });
         picture.add_controller(click);
     }
@@ -1692,18 +1830,13 @@ fn set_muted_state(state: &Rc<RefCell<AppState>>, muted: bool) {
 
 /// Refresh seek bar + time labels + play icon from the current media position.
 /// Called from timestamp/duration/playing notifies (signal-driven, no polling).
+/// Early-outs when nothing visible would change: the formatted second, the
+/// seek bar's own 500-step position, play state and the seeking flag
+/// (report #9 — this ran the full set on every GStreamer position tick).
 fn update_seek_ui(state: &Rc<RefCell<AppState>>) {
-    let (media, seeking, scale, pos, dur, play_btn, is_vid) = {
+    let (media, seeking, is_vid) = {
         let s = state.borrow();
-        (
-            s.media_file.clone(),
-            s.seeking,
-            s.seek_scale.clone(),
-            s.position_label.clone(),
-            s.duration_label.clone(),
-            s.play_pause_btn.clone(),
-            s.is_video,
-        )
+        (s.media_file.clone(), s.seeking, s.is_video)
     };
     let Some(media) = media else { return };
     if !is_vid {
@@ -1711,6 +1844,29 @@ fn update_seek_ui(state: &Rc<RefCell<AppState>>) {
     }
     let ts = media.timestamp();
     let dur_val = media.duration();
+    let playing = media.is_playing();
+    let bar_unit = if dur_val > 0 { ts * 500 / dur_val } else { 0 };
+    let key = (
+        ts / 1_000_000,
+        dur_val / 1_000_000,
+        bar_unit,
+        playing,
+        seeking,
+    );
+    if state.borrow().last_seek_ui == Some(key) {
+        return;
+    }
+    state.borrow_mut().last_seek_ui = Some(key);
+
+    let (scale, pos, dur, play_btn) = {
+        let s = state.borrow();
+        (
+            s.seek_scale.clone(),
+            s.position_label.clone(),
+            s.duration_label.clone(),
+            s.play_pause_btn.clone(),
+        )
+    };
     if !seeking {
         if let Some(scale) = scale {
             if dur_val > 0 {
@@ -1727,7 +1883,7 @@ fn update_seek_ui(state: &Rc<RefCell<AppState>>) {
         }
     }
     if let Some(btn) = play_btn {
-        sync_play_button(&btn, media.is_playing());
+        sync_play_button(&btn, playing);
     }
 }
 
@@ -1758,7 +1914,7 @@ fn collect_dir_media(dir: &Path) -> Vec<PathBuf> {
         return listed;
     }
     let fallback = collect_media_gio(&gio::File::for_path(dir));
-    debug_log(&format!(
+    debug_log!(format!(
         "drop GIO fallback: {} siblings for {}",
         fallback.len(),
         dir.display()
@@ -1778,7 +1934,7 @@ fn collect_media_gio(parent: &gio::File) -> Vec<PathBuf> {
         gio::FileQueryInfoFlags::NONE,
         None::<&gio::Cancellable>,
     ) else {
-        debug_log(&format!(
+        debug_log!(format!(
             "collect_media_gio: enumerate({}) failed",
             parent.uri()
         ));
@@ -1818,9 +1974,28 @@ fn arm_hide(
     top: &gtk::WindowHandle,
     bottom: &gtk::Box,
     hide_id: &Rc<Cell<Option<glib::SourceId>>>,
+    armed_us: &Rc<Cell<i64>>,
     delay_ms: u32,
     menu: &gtk::MenuButton,
 ) {
+    // Re-arm only when no timer is pending or the pending one is about to
+    // fire (armed ≥ delay − 500 ms ago): motion events used to destroy and
+    // recreate a glib source on every event — ~120 create/destroys per
+    // second at 120 Hz (report #7). While an early timer runs the panels
+    // simply hide a bit sooner; the ≥ delay − 500 ms check then pushes the
+    // deadline back out for as long as the pointer keeps moving.
+    // (`Option<SourceId>` isn't `Copy` and `Cell` has no `borrow`, so the
+    // pending id is inspected by take/put-back — single-threaded, with
+    // nothing reentrant in between.)
+    if let Some(id) = hide_id.take() {
+        let armed = armed_us.get();
+        let fresh =
+            armed != 0 && glib::monotonic_time() - armed < (i64::from(delay_ms) - 500) * 1000;
+        hide_id.set(Some(id));
+        if fresh {
+            return;
+        }
+    }
     cancel_hide(hide_id);
     let topc = top.clone();
     let bottomc = bottom.clone();
@@ -1839,6 +2014,7 @@ fn arm_hide(
         glib::ControlFlow::Break
     });
     hide_id.set(Some(sid));
+    armed_us.set(glib::monotonic_time());
 }
 
 fn schedule_update(
@@ -1950,7 +2126,7 @@ fn zoom_to(
         return;
     }
     let Some((iw, ih)) = intrinsic else {
-        debug_log(&format!(
+        debug_log!(format!(
             "zoom_to: {old_zoom:.2} -> {new_zoom:.2} (intrinsic unknown yet)"
         ));
         state.borrow_mut().zoom = new_zoom;
@@ -1958,6 +2134,21 @@ fn zoom_to(
         return;
     };
     let (vw, vh) = viewport;
+    // Past the zoom where fit × zoom reaches MAX_DIM, display sizes stop
+    // growing (display_size_for clamps) while `state.zoom` would keep
+    // climbing to ZOOM_MAX: a dead range of no-op anchor math (report,
+    // "zoom saturates silently" — ~9.1× in a 900 px viewport). Cap at the
+    // level where the larger fit edge hits MAX_DIM, floored at fit and
+    // never above ZOOM_MAX.
+    let (fw, fh) = zoom::fit_size(iw, ih, vw, vh);
+    let max_zoom = (state::MAX_DIM / fw.max(fh).max(1.0)).clamp(1.0, state::ZOOM_MAX);
+    new_zoom = new_zoom.min(max_zoom);
+    if !is_video {
+        new_zoom = new_zoom.max(1.0);
+    }
+    if (new_zoom - old_zoom).abs() < 0.0001 {
+        return;
+    }
     let (old_dw, old_dh) = zoom::effective_display_size_for(iw, ih, vw, vh, old_zoom, is_video);
     let (new_dw, new_dh) = zoom::effective_display_size_for(iw, ih, vw, vh, new_zoom, is_video);
 
@@ -1967,7 +2158,7 @@ fn zoom_to(
     let old_hv = hadj.value();
     let old_vv = vadj.value();
 
-    debug_log(&format!(
+    debug_log!(format!(
         "zoom_to: {old_zoom:.2} -> {new_zoom:.2} anchor={} ({ax:.0},{ay:.0})",
         if anchor.is_some() { "pt" } else { "center" }
     ));
@@ -2005,21 +2196,28 @@ fn zoom_to(
             // the target up once layout has grown the upper bound.
             if h_max > 0.0 && (hadj.value() - want_h).abs() > 0.5 {
                 hadj.set_value(want_h);
-                debug_log(&format!("zoom-anchor: h -> {want_h:.0}"));
+                debug_log!(format!("zoom-anchor: h -> {want_h:.0}"));
             }
             if v_max > 0.0 && (vadj.value() - want_v).abs() > 0.5 {
                 vadj.set_value(want_v);
-                debug_log(&format!("zoom-anchor: v -> {want_v:.0}"));
+                debug_log!(format!("zoom-anchor: v -> {want_v:.0}"));
             }
         }
     };
     apply_anchor(&hadj, &vadj);
     {
         let picture = picture.clone();
+        let state_poll = state.clone();
         let mut ticks: u32 = 0;
         let mut stable: u32 = 0;
         let mut prev: Option<AnchorSnap> = None;
         glib::timeout_add_local(Duration::from_millis(16), move || {
+            // Superseded by a newer zoom: stop instead of burning the full
+            // 40-tick budget — pinch fires scale_changed per frame, so
+            // overlapping pollers used to stack (report #7).
+            if (state_poll.borrow().zoom - new_zoom).abs() > 0.0001 {
+                return glib::ControlFlow::Break;
+            }
             ticks += 1;
             apply_anchor(&hadj, &vadj);
             let snap = AnchorSnap {
@@ -2035,7 +2233,7 @@ fn zoom_to(
             stable = if prev == Some(snap) { stable + 1 } else { 0 };
             prev = Some(snap);
             if stable >= 4 {
-                debug_log(&format!(
+                debug_log!(format!(
                     "zoom-settled: h={:.0} v={:.0} (t={}ms)",
                     hadj.value(),
                     vadj.value(),
@@ -2044,7 +2242,7 @@ fn zoom_to(
                 return glib::ControlFlow::Break;
             }
             if ticks >= 40 {
-                debug_log("zoom-anchor: deadline, stop re-anchoring");
+                debug_log!("zoom-anchor: deadline, stop re-anchoring");
                 return glib::ControlFlow::Break;
             }
             glib::ControlFlow::Continue
@@ -2081,7 +2279,7 @@ fn nav(
         s.index = new_index;
         s.zoom = 1.0;
     }
-    debug_log(&format!("nav: reset zoom to fit (index={new_index})"));
+    debug_log!(format!("nav: reset zoom to fit (index={new_index})"));
     reset_scroll(scrolled);
     show_file(state, picture, scrolled, window);
 }
@@ -2234,17 +2432,16 @@ fn try_slide_to(
 
     // Incoming images must be ready now (peek, don't consume: the main
     // fast path still takes the cache entry for itself). Prefetch stores
-    // EXIF-oriented pixels, so use them as-is (re-applying orientation
-    // would rotate portrait shots twice and glitch the transition).
+    // the finished texture, and the incoming frame + the main view share
+    // that single GPU copy (report #4: one upload, not two).
     let new_image: Option<(gdk::Paintable, i32, i32)> = if !new_is_video {
-        // (Two statements: the borrow must end before the pixels are used.)
-        let cached = state.borrow().prefetch.get(&path).cloned();
-        let Some(raw) = cached else {
+        // (Two statements: the borrow must end before the texture is used.)
+        let cached = state.borrow().prefetch_get(&path);
+        let Some(tex) = cached else {
             return false;
         };
-        let (iw, ih) = (raw.width().max(1), raw.height().max(1));
-        let tex: gdk::Paintable = media::texture_for_pixbuf(&raw).upcast();
-        Some((tex, iw, ih))
+        let (iw, ih) = (tex.width().max(1), tex.height().max(1));
+        Some((tex.upcast(), iw, ih))
     } else {
         None
     };
@@ -2256,7 +2453,7 @@ fn try_slide_to(
         s.index = new_index;
         s.zoom = 1.0;
     }
-    debug_log(&format!("try_slide: reset zoom to fit (index={new_index})"));
+    debug_log!(format!("try_slide: reset zoom to fit (index={new_index})"));
     reset_scroll(scrolled);
     show_file(state, picture, scrolled, window);
 
@@ -2361,6 +2558,66 @@ struct SlideCtx {
     new_index: usize,
 }
 
+/// Weak mirror of `SlideCtx` for `MediaFile` signal closures (report
+/// #2b): the state stays a std `Weak` and the widgets glib `WeakRef`s,
+/// so a slide/drag pipeline can never keep the stage — or the whole
+/// `AppState` — alive. Scalars are copied; `upgrade` rebuilds a strong
+/// ctx only while everything is still around.
+#[derive(Clone)]
+struct SlideCtxWeak {
+    state: std::rc::Weak<RefCell<AppState>>,
+    overlay: glib::WeakRef<gtk::Overlay>,
+    stage: glib::WeakRef<gtk::Fixed>,
+    old_pic: glib::WeakRef<gtk::Picture>,
+    obx: f64,
+    oby: f64,
+    w: i32,
+    h: i32,
+    vw: f64,
+    vh: f64,
+    dir: i32,
+    my_gen: u64,
+    new_index: usize,
+}
+
+impl SlideCtxWeak {
+    fn new(ctx: &SlideCtx) -> Self {
+        Self {
+            state: Rc::downgrade(&ctx.state),
+            overlay: ctx.overlay.downgrade(),
+            stage: ctx.stage.downgrade(),
+            old_pic: ctx.old_pic.downgrade(),
+            obx: ctx.obx,
+            oby: ctx.oby,
+            w: ctx.w,
+            h: ctx.h,
+            vw: ctx.vw,
+            vh: ctx.vh,
+            dir: ctx.dir,
+            my_gen: ctx.my_gen,
+            new_index: ctx.new_index,
+        }
+    }
+
+    fn upgrade(&self) -> Option<SlideCtx> {
+        Some(SlideCtx {
+            state: self.state.upgrade()?,
+            overlay: self.overlay.upgrade()?,
+            stage: self.stage.upgrade()?,
+            old_pic: self.old_pic.upgrade()?,
+            obx: self.obx,
+            oby: self.oby,
+            w: self.w,
+            h: self.h,
+            vw: self.vw,
+            vh: self.vh,
+            dir: self.dir,
+            my_gen: self.my_gen,
+            new_index: self.new_index,
+        })
+    }
+}
+
 /// Incoming video for a slide: its own muted pipeline + wrapper, traveling
 /// once prepared with a known intrinsic size (then pre-scaled like the
 /// main path). Weak refs only, so abandoning never leaks a pipeline.
@@ -2389,9 +2646,12 @@ fn preload_slide_video(ctx: &SlideCtx, path: &Path) {
     // below, else RefCell panics.)
     let weak_media = media.downgrade();
     let weak_wrap = wrap.downgrade();
+    // Every strong capture is weak here (report #2b): media → these
+    // handlers → maybe_start → new_pic → wrap → media used to pin a
+    // muted *playing, looping* pipeline plus the whole slide stage.
     let maybe_start = {
-        let ctx = ctx.clone();
-        let new_pic = new_pic.clone();
+        let ctx_w = SlideCtxWeak::new(ctx);
+        let new_pic_w = new_pic.downgrade();
         let started = started.clone();
         let size_handler = size_handler.clone();
         move || {
@@ -2402,6 +2662,12 @@ fn preload_slide_video(ctx: &SlideCtx, path: &Path) {
                 return;
             };
             let Some((sw, sh)) = zoom::video_intrinsic(&m) else {
+                return;
+            };
+            let Some(ctx) = ctx_w.upgrade() else {
+                return;
+            };
+            let Some(new_pic) = new_pic_w.upgrade() else {
                 return;
             };
             // Superseded (rapid nav, Home/End, trash): reveal, never slide stale frames.
@@ -2461,13 +2727,16 @@ fn preload_slide_video(ctx: &SlideCtx, path: &Path) {
         }
     }
     {
-        let ctx = ctx.clone();
+        let ctx_w = SlideCtxWeak::new(ctx);
         media.connect_error_notify(move |_| {
-            abandon_slide(&ctx.state, ctx.my_gen);
+            if let Some(c) = ctx_w.upgrade() {
+                abandon_slide(&c.state, c.my_gen);
+            }
         });
     }
     // Stuck pipeline (slow mount, missing codec with no error yet):
-    // reveal the main view instead of covering it forever.
+    // reveal the main view instead of covering it forever. This one-shot
+    // timeout may hold a strong ctx for its bounded 2 s (by design).
     {
         let ctx = ctx.clone();
         let started = started.clone();
@@ -2583,18 +2852,20 @@ fn commit_index(
         s.index = new_index;
         s.zoom = 1.0;
     }
-    debug_log(&format!(
+    debug_log!(format!(
         "commit_index: reset zoom to fit (index={new_index})"
     ));
     reset_scroll(scrolled);
     show_file(state, picture, scrolled, window);
 }
+/// Open the preferences dialog: slide animation + two-finger swipe, written to a
 /// file so they survive restarts (Flatpak included).
 fn show_preferences(state: &Rc<RefCell<AppState>>, window: &adw::ApplicationWindow) {
-    let dialog = adw::PreferencesWindow::builder()
+    // AdwPreferencesWindow is deprecated since libadwaita 1.6 (the version
+    // meson.build requires); its dialog replacement takes the parent at
+    // present() time and has no modal flag (dialogs always are).
+    let dialog = adw::PreferencesDialog::builder()
         .title("Preferences")
-        .transient_for(window)
-        .modal(true)
         .build();
     let page = adw::PreferencesPage::builder()
         .title("General")
@@ -2639,7 +2910,7 @@ fn show_preferences(state: &Rc<RefCell<AppState>>, window: &adw::ApplicationWind
     nav_group.add(&fingers_row);
     page.add(&nav_group);
     dialog.add(&page);
-    dialog.present();
+    dialog.present(Some(window));
 }
 
 fn animations_enabled(state: &Rc<RefCell<AppState>>) -> bool {
@@ -2708,7 +2979,7 @@ fn handle_touchpad(
     if tp.n_fingers() != swipe_fingers(state) {
         return glib::Propagation::Proceed;
     }
-    debug_log(&format!(
+    debug_log!(format!(
         "touchpad swipe: n={} phase={:?}",
         tp.n_fingers(),
         tp.gesture_phase()
@@ -2898,7 +3169,7 @@ fn drag_lock(state: &Rc<RefCell<AppState>>) {
     };
     let new_is_video = state::has_ext(&path, state::VIDEO_EXTS);
     // Peek before mutating (borrow discipline).
-    let have_frame = new_is_video || state.borrow().prefetch.contains_key(&path);
+    let have_frame = new_is_video || state.borrow().prefetch_contains(&path);
     {
         let mut s = state.borrow_mut();
         let Some(d) = s.drag.as_mut() else { return };
@@ -2913,19 +3184,19 @@ fn drag_lock(state: &Rc<RefCell<AppState>>) {
         drag_lock_video(state, &path, vw, vh, new_index);
         return;
     }
-    // Image: use the prefetched frame as-is (prefetch stores EXIF-oriented
-    // pixels; re-applying orientation would rotate portrait shots twice).
-    // (Two statements: the clone must finish before pixels are used.)
-    let raw = state.borrow().prefetch.get(&path).cloned();
-    let Some(raw) = raw else {
+    // Image: the prefetched texture as-is (already EXIF-oriented; the main
+    // view takes the same entry on commit — one upload, report #4).
+    // (Two statements: the clone must finish before the texture is used.)
+    let cached = state.borrow().prefetch_get(&path);
+    let Some(tex) = cached else {
         // Evicted between lock and decode: track blind, release cuts.
         if let Some(d) = state.borrow_mut().drag.as_mut() {
             d.visual = false;
         }
         return;
     };
-    let (iw, ih) = (raw.width().max(1), raw.height().max(1));
-    let tex: gdk::Paintable = media::texture_for_pixbuf(&raw).upcast();
+    let (iw, ih) = (tex.width().max(1), tex.height().max(1));
+    let tex: gdk::Paintable = tex.upcast();
     let (dw, dh) = zoom::display_size_for(iw as f64, ih as f64, vw, vh, 1.0);
     let (stage, w, vh, dir) = {
         let s = state.borrow();
@@ -2994,10 +3265,12 @@ fn drag_lock_video(state: &Rc<RefCell<AppState>>, path: &Path, vw: f64, vh: f64,
     let size_handler: Rc<RefCell<Option<glib::SignalHandlerId>>> = Rc::new(RefCell::new(None));
     let weak_media = media.downgrade();
     let weak_wrap = wrap.downgrade();
+    // Weak captures (report #2b): media → this handler → new_pic → wrap
+    // → media, and → state → drag → new_pic, are both real cycles.
     let maybe_ready = {
-        let state = state.clone();
-        let stage = stage.clone();
-        let new_pic = new_pic.clone();
+        let state_w = Rc::downgrade(state);
+        let stage_w = stage.downgrade();
+        let new_pic_w = new_pic.downgrade();
         let started = started.clone();
         let size_handler = size_handler.clone();
         move || {
@@ -3008,6 +3281,9 @@ fn drag_lock_video(state: &Rc<RefCell<AppState>>, path: &Path, vw: f64, vh: f64,
                 return;
             };
             let Some((sw, sh)) = zoom::video_intrinsic(&m) else {
+                return;
+            };
+            let Some(state) = state_w.upgrade() else {
                 return;
             };
             {
@@ -3023,6 +3299,12 @@ fn drag_lock_video(state: &Rc<RefCell<AppState>>, path: &Path, vw: f64, vh: f64,
                     return;
                 }
             }
+            let Some(stage) = stage_w.upgrade() else {
+                return;
+            };
+            let Some(new_pic) = new_pic_w.upgrade() else {
+                return;
+            };
             let (dw, dh) = zoom::display_size_for(sw, sh, vw, vh, 1.0);
             let (fw, fh) = zoom::fit_size(sw, sh, vw, vh);
             if let Some(wp) = weak_wrap.upgrade() {
@@ -3070,9 +3352,12 @@ fn drag_lock_video(state: &Rc<RefCell<AppState>>, path: &Path, vw: f64, vh: f64,
         }
     }
     {
-        let state = state.clone();
+        let state_w = Rc::downgrade(state);
         media.connect_error_notify(move |_| {
             // Release will reveal the main view; mark unready now.
+            let Some(state) = state_w.upgrade() else {
+                return;
+            };
             let mut s = state.borrow_mut();
             if s.slide_gen == gen {
                 if let Some(d) = s.drag.as_mut() {
@@ -3176,6 +3461,10 @@ fn trash_current(
         show_toast(state, "Wait for the save to finish first");
         return;
     }
+    // One request at a time: results arrive asynchronously now.
+    if state.borrow().trashing {
+        return;
+    }
     let path = {
         let s = state.borrow();
         if s.files.is_empty() {
@@ -3189,40 +3478,53 @@ fn trash_current(
         .unwrap_or("file")
         .to_string();
 
-    // GIO trash (goes to Trash, not permanent delete). Needs write access
-    // to the containing directory (Flatpak: --filesystem=host:rw).
+    // GIO trash (goes to Trash, not permanent delete), async so a
+    // network/portal path can't freeze the UI (report #8). Needs write
+    // access to the containing directory (Flatpak: --filesystem=host:rw).
     let file = gio::File::for_path(&path);
-    if let Err(e) = file.trash(None::<&gio::Cancellable>) {
-        debug_log(&format!("trash failed for {}: {e}", path.display()));
-        if is_doc_portal_path(&path) {
-            show_toast(
-                state,
-                "Cannot move to Trash from sandbox portal — use the Files app",
-            );
-        } else {
-            show_toast(state, &format!("Cannot move {name} to Trash"));
-        }
-        return;
-    }
+    state.borrow_mut().trashing = true;
+    let state_c = state.clone();
+    let picture_c = picture.clone();
+    let scrolled_c = scrolled.clone();
+    let window_c = window.clone();
+    file.trash_async(
+        glib::Priority::DEFAULT,
+        None::<&gio::Cancellable>,
+        move |res| {
+            state_c.borrow_mut().trashing = false;
+            if let Err(e) = res {
+                debug_log!(format!("trash failed for {}: {e}", path.display()));
+                if is_doc_portal_path(&path) {
+                    show_toast(
+                        &state_c,
+                        "Cannot move to Trash from sandbox portal — use the Files app",
+                    );
+                } else {
+                    show_toast(&state_c, &format!("Cannot move {name} to Trash"));
+                }
+                return;
+            }
 
-    // (Two statements: the position lookup must finish before the mutable
-    // borrow below, else RefCell panics.)
-    let pos = state.borrow().files.iter().position(|f| f == &path);
-    cancel_slide(state);
-    {
-        let mut s = state.borrow_mut();
-        if let Some(pos) = pos {
-            s.files.remove(pos);
-            s.prefetch.remove(&path);
-            s.index = state::index_after_removal(s.files.len(), s.index, pos);
-            s.zoom = 1.0;
-        }
-    }
-    reset_scroll(scrolled);
-    show_file(state, picture, scrolled, window);
-    if !state.borrow().files.is_empty() {
-        show_toast(state, &format!("Moved {name} to Trash"));
-    }
+            // (Two statements: the position lookup must finish before the
+            // mutable borrow below, else RefCell panics.)
+            let pos = state_c.borrow().files.iter().position(|f| f == &path);
+            cancel_slide(&state_c);
+            {
+                let mut s = state_c.borrow_mut();
+                if let Some(pos) = pos {
+                    s.files.remove(pos);
+                    s.prefetch_drop(&path);
+                    s.index = state::index_after_removal(s.files.len(), s.index, pos);
+                    s.zoom = 1.0;
+                }
+            }
+            reset_scroll(&scrolled_c);
+            show_file(&state_c, &picture_c, &scrolled_c, &window_c);
+            if !state_c.borrow().files.is_empty() {
+                show_toast(&state_c, &format!("Moved {name} to Trash"));
+            }
+        },
+    );
 }
 
 /// Worker result of a transform: encoded bytes plus the original file mode
@@ -3264,7 +3566,7 @@ fn run_transform(
         }
         s.files[s.index].clone()
     };
-    debug_log(&format!("transform: {op:?} {}", path.display()));
+    debug_log!(format!("transform: {op:?} {}", path.display()));
     cancel_slide(state);
     {
         let mut s = state.borrow_mut();
@@ -3314,7 +3616,7 @@ fn run_transform(
         }
         ticks += 1;
         if ticks >= 1_875 {
-            debug_log("transform: worker never reported back, giving up");
+            debug_log!("transform: worker never reported back, giving up");
             show_toast(&state_c, "Transform timed out");
             state_c.borrow_mut().saving = false;
             sync_transform_buttons(&state_c);
@@ -3336,7 +3638,7 @@ fn finish_transform(
     let (bytes, mode) = match result {
         Ok(ok) => ok,
         Err(msg) => {
-            debug_log(&format!("transform failed for {}: {msg}", path.display()));
+            debug_log!(format!("transform failed for {}: {msg}", path.display()));
             let hint = if is_doc_portal_path(path) {
                 " — use Open Folder so the file is writable"
             } else {
@@ -3368,7 +3670,7 @@ fn finish_transform(
         move |res| {
             match res {
                 Ok(_) => {
-                    debug_log(&format!("transform: saved {}", path_c.display()));
+                    debug_log!(format!("transform: saved {}", path_c.display()));
                     // GIO replaced the file: put the original mode back.
                     if let Some(mode) = mode {
                         let _ = std::fs::set_permissions(&path_c, mode);
@@ -3377,7 +3679,7 @@ fn finish_transform(
                         let mut s = state_c.borrow_mut();
                         s.saving = false;
                         // Drop pixels decoded from the pre-transform file.
-                        s.prefetch.remove(&path_c);
+                        s.prefetch_drop(&path_c);
                     }
                     sync_transform_buttons(&state_c);
                     // Refresh only if this file is still on screen.
@@ -3390,7 +3692,7 @@ fn finish_transform(
                     }
                 }
                 Err((_, e)) => {
-                    debug_log(&format!("transform: save failed for {}: {e}", path_c.display()));
+                    debug_log!(format!("transform: save failed for {}: {e}", path_c.display()));
                     if is_doc_portal_path(&path_c) {
                         show_toast(
                             &state_c,
@@ -3413,6 +3715,9 @@ fn show_file(
     scrolled: &gtk::ScrolledWindow,
     window: &adw::ApplicationWindow,
 ) {
+    // A new item is coming: stop prefetching the old neighbors (videos
+    // and errors never reach prefetch_neighbors, so cancel here too).
+    cancel_prefetch(state);
     let (path, idx, total) = {
         let s = state.borrow();
         if s.files.is_empty() {
@@ -3469,6 +3774,174 @@ fn show_file(
     sync_transform_buttons(state);
 }
 
+/// Attach `picture` to `scrolled` only when not already there — the
+/// child never changes, so re-issuing `set_child` on every show was pure
+/// container churn (report: lower-impact polish).
+fn ensure_picture_child(scrolled: &gtk::ScrolledWindow, picture: &gtk::Picture) {
+    let attached = scrolled
+        .child()
+        .is_some_and(|w| w == picture.clone().upcast::<gtk::Widget>());
+    if !attached {
+        scrolled.set_child(Some(picture));
+    }
+}
+
+/// Drop + cancel the in-flight display decode. Called right after the
+/// `image_gen` bump, so the stale round's poller exits on its generation
+/// guard and its worker stops before read/decode (report #1's pipeline
+/// with report #3-style cancellation).
+fn cancel_decode(state: &Rc<RefCell<AppState>>) {
+    let old = state.borrow_mut().decode_cancel.take();
+    if let Some(c) = old {
+        c.cancel();
+    }
+}
+
+/// Drop + cancel the current prefetch round (`show_file` entry; a new
+/// round also supersedes in `prefetch_neighbors`).
+fn cancel_prefetch(state: &Rc<RefCell<AppState>>) {
+    let old = state.borrow_mut().prefetch_cancel.take();
+    if let Some(c) = old {
+        c.cancel();
+    }
+}
+
+/// Worker for one read+decode round: plain `Send` data only (Pixbuf is
+/// `!Send` — see AGENTS.md). Checks the round's `Cancellable` before the
+/// read, before the decode and before publishing, so a superseded round
+/// stores nothing and its poller can retire early (report #1 + #3).
+fn spawn_frame_worker(
+    cancel: gio::Cancellable,
+    path: PathBuf,
+) -> Arc<Mutex<Option<Result<transform::Decoded, String>>>> {
+    let slot: Arc<Mutex<Option<Result<transform::Decoded, String>>>> = Arc::new(Mutex::new(None));
+    let slot_c = slot.clone();
+    std::thread::spawn(move || {
+        let result = (|| -> Result<transform::Decoded, String> {
+            if cancel.is_cancelled() {
+                return Err("cancelled".into());
+            }
+            let bytes =
+                std::fs::read(&path).map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
+            if cancel.is_cancelled() {
+                return Err("cancelled".into());
+            }
+            transform::decode_frame(&bytes)
+        })();
+        if cancel.is_cancelled() {
+            return;
+        }
+        if let Ok(mut guard) = slot_c.lock() {
+            *guard = Some(result);
+        }
+    });
+    slot
+}
+
+/// Wrap decoded RGBA rows in a GPU texture. Main thread only
+/// (`MemoryTexture` asserts it) and zero-copy: `Bytes::from_owned` takes
+/// the worker's `Vec` as-is.
+fn frame_texture(frame: transform::Decoded) -> gdk::Texture {
+    let stride = frame.w as usize * 4;
+    gdk::MemoryTexture::new(
+        frame.w,
+        frame.h,
+        gdk::MemoryFormat::R8g8b8a8,
+        &glib::Bytes::from_owned(frame.rgba),
+        stride,
+    )
+    .upcast()
+}
+
+/// Worker delivered a decoded frame: wrap it and put it on screen.
+fn present_image(
+    state: &Rc<RefCell<AppState>>,
+    picture: &gtk::Picture,
+    scrolled: &gtk::ScrolledWindow,
+    frame: transform::Decoded,
+    gen: u64,
+) {
+    if state.borrow().image_gen != gen {
+        return;
+    }
+    let tex = frame_texture(frame);
+    let (w, h) = (tex.width().max(1), tex.height().max(1));
+    {
+        let mut s = state.borrow_mut();
+        if s.image_gen != gen {
+            return;
+        }
+        s.image_w = w;
+        s.image_h = h;
+    }
+    ensure_picture_child(scrolled, picture);
+    picture.set_paintable(Some(&tex));
+    picture.set_content_fit(gtk::ContentFit::Contain);
+    reset_scroll(scrolled);
+    schedule_update(state, picture, scrolled);
+    prefetch_neighbors(state);
+}
+
+/// Read + decode + EXIF-orient the display frame on a worker thread
+/// (report #1: gdk-pixbuf's "async" stream decode, the synchronous EXIF
+/// file read and the orientation transpose all ran on the main thread).
+/// The worker returns plain bytes; the main context only builds the
+/// texture. The slot is polled every frame (glib has no channel and
+/// `idle_add` closures must be `Send` — same pattern as the transform
+/// worker), with `image_gen` + `Cancellable` discarding stale rounds.
+fn spawn_decode(
+    state: &Rc<RefCell<AppState>>,
+    picture: &gtk::Picture,
+    scrolled: &gtk::ScrolledWindow,
+    path: &Path,
+    gen: u64,
+) {
+    let cancel = gio::Cancellable::new();
+    state.borrow_mut().decode_cancel = Some(cancel.clone());
+    let slot = spawn_frame_worker(cancel.clone(), path.to_path_buf());
+
+    let state_c = state.clone();
+    let picture_c = picture.clone();
+    let scrolled_c = scrolled.clone();
+    let path_c = path.to_path_buf();
+    let mut ticks: u32 = 0;
+    glib::timeout_add_local(Duration::from_millis(16), move || {
+        // Superseded (a newer show bumped `image_gen`, or the round was
+        // cancelled): drop the result without touching the widgets.
+        if state_c.borrow().image_gen != gen || cancel.is_cancelled() {
+            return glib::ControlFlow::Break;
+        }
+        let taken = match slot.lock() {
+            Ok(mut guard) => guard.take(),
+            Err(_) => None,
+        };
+        if let Some(result) = taken {
+            match result {
+                Ok(frame) => present_image(&state_c, &picture_c, &scrolled_c, frame, gen),
+                Err(msg) => {
+                    debug_log!(format!("Failed to load {}: {msg}", path_c.display()));
+                    picture_c.set_paintable(None::<&gdk::Texture>);
+                    show_toast(
+                        &state_c,
+                        &format!(
+                            "Failed to load {}",
+                            path_c.file_name().unwrap_or_default().to_string_lossy()
+                        ),
+                    );
+                }
+            }
+            return glib::ControlFlow::Break;
+        }
+        ticks += 1;
+        if ticks >= 1_875 {
+            debug_log!("decode: worker never reported back, giving up");
+            show_toast(&state_c, "Image load timed out");
+            return glib::ControlFlow::Break;
+        }
+        glib::ControlFlow::Continue
+    });
+}
+
 fn show_image(
     state: &Rc<RefCell<AppState>>,
     picture: &gtk::Picture,
@@ -3491,9 +3964,13 @@ fn show_image(
         s.image_gen = s.image_gen.wrapping_add(1);
         s.image_w = 0;
         s.image_h = 0;
-        s.original_pixbuf = None;
     }
-    debug_log(&format!(
+    // Release the last video's pipeline: the wrapper paintable kept it
+    // alive even while browsing photos (report #2 — never cleared).
+    // Clone out first: set_inner's invalidate notifies run synchronously.
+    let video_view = state.borrow().video_view.clone();
+    video_view.set_inner(None);
+    debug_log!(format!(
         "show_image: reset zoom to fit ({})",
         path.display()
     ));
@@ -3504,15 +3981,15 @@ fn show_image(
 
     let path_buf = path.to_path_buf();
     let gen = state.borrow().image_gen;
+    // Generation bumped above: any in-flight decode is stale now.
+    cancel_decode(state);
 
     // Fast path: prefetched neighbor already decoded.
-    // (Two statements: the RefMut from the remove must drop before the
-    // body borrows state again, else RefCell panics.)
-    let cached = state.borrow_mut().prefetch.remove(&path_buf);
-    if let Some(cached) = cached {
-        let w = cached.width().max(1);
-        let h = cached.height().max(1);
-        let tex = media::texture_for_pixbuf(&cached);
+    // (Two statements: the take must drop its borrow before the body
+    // borrows state again, else RefCell panics.)
+    let cached = state.borrow_mut().prefetch_take(&path_buf);
+    if let Some(tex) = cached {
+        let (w, h) = (tex.width().max(1), tex.height().max(1));
         {
             let mut s = state.borrow_mut();
             if s.image_gen != gen {
@@ -3520,10 +3997,8 @@ fn show_image(
             }
             s.image_w = w;
             s.image_h = h;
-            // Drop CPU pixels after GPU upload; dimensions retained for zoom.
-            s.original_pixbuf = None;
         }
-        scrolled.set_child(Some(picture));
+        ensure_picture_child(scrolled, picture);
         picture.set_paintable(Some(&tex));
         picture.set_content_fit(gtk::ContentFit::Contain);
         reset_scroll(scrolled);
@@ -3532,78 +4007,16 @@ fn show_image(
         return;
     }
 
-    // Async decode via GIO (never blocks the UI thread on large files).
-    // Stale results are discarded via image_gen. EXIF read is a tiny header
-    // parse kept synchronous after decode.
-    let state_c = state.clone();
-    let picture_c = picture.clone();
-    let scrolled_c = scrolled.clone();
-    let path_c = path_buf.clone();
-    let file = gio::File::for_path(&path_buf);
-    file.read_async(
-        glib::Priority::DEFAULT,
-        None::<&gio::Cancellable>,
-        move |res| {
-            let Ok(stream) = res else {
-                if state_c.borrow().image_gen != gen {
-                    return;
-                }
-                picture_c.set_paintable(None::<&gdk::Texture>);
-                show_toast(
-                    &state_c,
-                    &format!(
-                        "Failed to load {}",
-                        path_c.file_name().unwrap_or_default().to_string_lossy()
-                    ),
-                );
-                return;
-            };
-            let state_c2 = state_c.clone();
-            let picture_c2 = picture_c.clone();
-            let scrolled_c2 = scrolled_c.clone();
-            gdk_pixbuf::Pixbuf::from_stream_async(&stream, None::<&gio::Cancellable>, move |res| {
-                if state_c2.borrow().image_gen != gen {
-                    return;
-                }
-                match res {
-                    Ok(raw) => {
-                        let orientation = media::read_exif_orientation(&path_c);
-                        let pixbuf = media::apply_orientation(&raw, orientation);
-                        let w = pixbuf.width().max(1);
-                        let h = pixbuf.height().max(1);
-                        let tex = media::texture_for_pixbuf(&pixbuf);
-                        {
-                            let mut s = state_c2.borrow_mut();
-                            s.image_w = w;
-                            s.image_h = h;
-                            s.original_pixbuf = None;
-                        }
-                        scrolled_c2.set_child(Some(&picture_c2));
-                        picture_c2.set_paintable(Some(&tex));
-                        picture_c2.set_content_fit(gtk::ContentFit::Contain);
-                        reset_scroll(&scrolled_c2);
-                        schedule_update(&state_c2, &picture_c2, &scrolled_c2);
-                        prefetch_neighbors(&state_c2);
-                    }
-                    Err(e) => {
-                        debug_log(&format!("Failed to load: {}", e));
-                        picture_c2.set_paintable(None::<&gdk::Texture>);
-                        show_toast(
-                            &state_c2,
-                            &format!(
-                                "Failed to load {}",
-                                path_c.file_name().unwrap_or_default().to_string_lossy()
-                            ),
-                        );
-                    }
-                }
-            });
-        },
-    );
+    spawn_decode(state, picture, scrolled, &path_buf, gen);
 }
 
 /// Decode next/prev images in the background so navigation feels instant.
-/// Bounded to 2 entries; GIO-async so the UI never blocks.
+/// Bounded to 2 entries with FIFO eviction; one round per navigation:
+/// the previous round's `GCancellable` is cancelled first, results
+/// re-check the target is still a neighbor, and the neighbor paths are
+/// read straight from the borrow — no per-nav `files.clone()` (report
+/// #3). Decode runs on a worker thread (#1) and the cache stores the
+/// finished texture, shared by slide/drag/main (#4).
 fn prefetch_neighbors(state: &Rc<RefCell<AppState>>) {
     // While a transform save is in flight, a decode started now could land
     // around the atomic replace and cache pre-transform pixels. Navigation
@@ -3611,49 +4024,73 @@ fn prefetch_neighbors(state: &Rc<RefCell<AppState>>) {
     if state.borrow().saving {
         return;
     }
-    let (files, index) = {
+    let targets: Vec<PathBuf> = {
         let s = state.borrow();
-        (s.files.clone(), s.index)
+        if s.files.is_empty() {
+            return;
+        }
+        let mut targets = Vec::with_capacity(2);
+        if s.index + 1 < s.files.len() {
+            targets.push(s.files[s.index + 1].clone());
+        }
+        if s.index > 0 {
+            targets.push(s.files[s.index - 1].clone());
+        }
+        targets
     };
-    if files.is_empty() {
-        return;
-    }
-    let mut targets = Vec::new();
-    if index + 1 < files.len() {
-        targets.push(files[index + 1].clone());
-    }
-    if index > 0 {
-        targets.push(files[index - 1].clone());
-    }
+    // Supersede the previous round (report #3.1).
+    cancel_prefetch(state);
+    let cancel = gio::Cancellable::new();
+    state.borrow_mut().prefetch_cancel = Some(cancel.clone());
+
     for target in targets {
         if !state::has_ext(&target, state::IMAGE_EXTS) {
             continue;
         }
-        if state.borrow().prefetch.contains_key(&target) {
+        if state.borrow().prefetch_contains(&target) {
             continue;
         }
+        let slot = spawn_frame_worker(cancel.clone(), target.clone());
         let state_c = state.clone();
-        let file = gio::File::for_path(&target);
-        file.read_async(glib::Priority::LOW, None::<&gio::Cancellable>, move |res| {
-            let Ok(stream) = res else { return };
-            let state_c2 = state_c.clone();
-            gdk_pixbuf::Pixbuf::from_stream_async(&stream, None::<&gio::Cancellable>, move |res| {
-                let Ok(raw) = res else { return };
-                let orientation = media::read_exif_orientation(&target);
-                let pixbuf = media::apply_orientation(&raw, orientation);
-                let mut s = state_c2.borrow_mut();
-                if s.prefetch.contains_key(&target) {
-                    return;
-                }
-                while s.prefetch.len() >= 2 {
-                    if let Some(k) = s.prefetch.keys().next().cloned() {
-                        s.prefetch.remove(&k);
-                    } else {
-                        break;
+        let round = cancel.clone();
+        let path_c = target;
+        let mut ticks: u32 = 0;
+        glib::timeout_add_local(Duration::from_millis(16), move || {
+            if round.is_cancelled() {
+                return glib::ControlFlow::Break;
+            }
+            let taken = match slot.lock() {
+                Ok(mut guard) => guard.take(),
+                Err(_) => None,
+            };
+            if let Some(result) = taken {
+                // Re-check the target is still a neighbor: fast back-and-
+                // forth nav can move the index twice inside one round
+                // (report #3.2 — stale decodes used to evict fresh ones).
+                let still = {
+                    let s = state_c.borrow();
+                    let i = s.index;
+                    (i + 1 < s.files.len() && s.files[i + 1] == path_c)
+                        || (i > 0 && s.files[i - 1] == path_c)
+                };
+                match result {
+                    Ok(frame) if still => {
+                        let tex = frame_texture(frame);
+                        state_c.borrow_mut().prefetch_store(&path_c, tex);
+                    }
+                    Ok(_) => {}
+                    Err(msg) => {
+                        debug_log!(format!("prefetch {}: {msg}", path_c.display()));
                     }
                 }
-                s.prefetch.insert(target, pixbuf);
-            });
+                return glib::ControlFlow::Break;
+            }
+            ticks += 1;
+            if ticks >= 1_875 {
+                debug_log!(format!("prefetch: worker silent for {}", path_c.display()));
+                return glib::ControlFlow::Break;
+            }
+            glib::ControlFlow::Continue
         });
     }
 }
@@ -3698,7 +4135,7 @@ fn update_display(
         s.image_h,
         &s.media_file,
     ) else {
-        debug_log(&format!(
+        debug_log!(format!(
             "update_display: intrinsic unknown (is_video={})",
             is_video
         ));
@@ -3719,13 +4156,29 @@ fn update_display(
     }
 
     let (dw, dh) = zoom::display_size_for(iw, ih, vw, vh, zoom);
-    debug_log(&format!(
+    let (fit_w, fit_h) = if is_video {
+        zoom::fit_size(iw, ih, vw, vh)
+    } else {
+        (0.0, 0.0)
+    };
+    debug_log!(format!(
         "update_display: is_video={is_video} intrinsic={iw:.0}x{ih:.0} viewport={vw:.0}x{vh:.0} zoom={zoom:.2} display={dw}x{dh}"
     ));
+    // Skip when every output would be set to the value it already has
+    // (report: lower-impact polish) — unless the video still needs its
+    // paintable attached, which the key alone can't cover.
+    let needs_paintable = is_video && picture.paintable().is_none();
+    if !needs_paintable {
+        let key = (dw, dh, is_video, fit_w, fit_h, zoom);
+        let mut s = state.borrow_mut();
+        if s.last_layout == Some(key) {
+            return;
+        }
+        s.last_layout = Some(key);
+    }
     if is_video {
         let zp = state.borrow().video_view.clone();
-        let (fw, fh) = zoom::fit_size(iw, ih, vw, vh);
-        zp.set_view(fw, fh, zoom);
+        zp.set_view(fit_w, fit_h, zoom);
         picture.set_content_fit(gtk::ContentFit::Fill);
         picture.set_size_request(dw, dh);
         if picture.paintable().is_none() {
@@ -3735,7 +4188,7 @@ fn update_display(
     } else {
         picture.set_content_fit(gtk::ContentFit::Contain);
         picture.set_size_request(dw, dh);
-        // Paintable is set at load time; no pixbuf retained (memory: GPU copy only).
+        // Paintable is set at load time; only the GPU copy is retained.
     }
 }
 
@@ -3753,15 +4206,16 @@ fn show_video(
         old.pause();
     }
     let mut s = state.borrow_mut();
-    s.original_pixbuf = None;
     s.image_w = 0;
     s.image_h = 0;
     // Invalidate any in-flight async image load.
     s.image_gen = s.image_gen.wrapping_add(1);
     s.zoom = 1.0;
     s.is_video = true;
-    debug_log("show_video: reset zoom to fit");
+    debug_log!("show_video: reset zoom to fit");
     s.seeking = false;
+    // The seek early-out key is per-media (report #9).
+    s.last_seek_ui = None;
     s.video_gen = s.video_gen.wrapping_add(1);
     s.video_w = 0;
     s.video_h = 0;
@@ -3778,6 +4232,9 @@ fn show_video(
     }
     let volume_scale = s.volume_scale.clone();
     drop(s);
+
+    // Image decode in flight? Its generation was bumped above — cancel it.
+    cancel_decode(state);
 
     state.borrow_mut().skip_volume_update = true;
     if let Some(ref scale) = volume_scale {
@@ -3800,11 +4257,15 @@ fn show_video(
 
     state.borrow_mut().media_file = Some(media.clone());
 
-    // Delay play() until the GStreamer pipeline is prepared
+    // Delay play() until the GStreamer pipeline is prepared. Weak
+    // self-capture: a strong one is a permanent refcycle (the handler
+    // only drops at finalize, and it keeps the object alive — report #2a).
     {
-        let media_clone = media.clone();
+        let weak_media = media.downgrade();
         media.connect_prepared_notify(move |_| {
-            media_clone.play();
+            if let Some(m) = weak_media.upgrade() {
+                m.play();
+            }
         });
         if media.is_prepared() {
             media.play();
@@ -3813,7 +4274,7 @@ fn show_video(
 
     let zp = state.borrow().video_view.clone();
     zp.set_inner(Some(media.clone().upcast()));
-    scrolled.set_child(Some(picture));
+    ensure_picture_child(scrolled, picture);
     picture.set_content_fit(gtk::ContentFit::Fill);
     let zp_paintable: gdk::Paintable = zp.clone().upcast();
     picture.set_paintable(Some(&zp_paintable));
@@ -3823,14 +4284,25 @@ fn show_video(
 
     // When the video's intrinsic size becomes known, re-fit.
     // Size discovery disconnects after the first hit (no per-frame work).
+    // All captures weak (report #2a): media → this handler → media (and
+    // → state/widgets → video paintable → media) must not keep the
+    // pipeline alive after the window is gone.
     {
-        let state_c = state.clone();
-        let picture_c = picture.clone();
-        let scrolled_c = scrolled.clone();
-        let media_c = media.clone();
+        let weak_state = Rc::downgrade(state);
+        let weak_pic = picture.downgrade();
+        let weak_scrolled = scrolled.downgrade();
+        let weak_media = media.downgrade();
         let size_handler = Rc::new(RefCell::new(None::<glib::SignalHandlerId>));
         let size_handler_c = size_handler.clone();
         let id = media.connect_invalidate_size(move |_| {
+            let (Some(state_c), Some(picture_c), Some(scrolled_c), Some(media_c)) = (
+                weak_state.upgrade(),
+                weak_pic.upgrade(),
+                weak_scrolled.upgrade(),
+                weak_media.upgrade(),
+            ) else {
+                return;
+            };
             if let Some((w, h)) = zoom::video_intrinsic(&media_c) {
                 let (wi, hi) = (w as i32, h as i32);
                 let changed = {
@@ -3844,7 +4316,7 @@ fn show_video(
                     }
                 };
                 if changed {
-                    debug_log(&format!("video: size discovered {wi}x{hi}"));
+                    debug_log!(format!("video: size discovered {wi}x{hi}"));
                     schedule_update(&state_c, &picture_c, &scrolled_c);
                     // Size known: stop listening (one-shot).
                     if let Some(hid) = size_handler_c.borrow_mut().take() {
@@ -3859,41 +4331,55 @@ fn show_video(
     }
 
     // Signal-driven seek UI: timestamp/duration/playing notifies replace the
-    // old 200ms poll (idle even when paused). Seeking flag clears on seek-done.
+    // old 200ms poll (idle even when paused). Seeking flag clears on
+    // seek-done. Weak `state` captures (report #2a): state → media_file →
+    // these handlers → state is exactly the cycle that leaked the widget
+    // graph plus a paused pipeline after every video ever shown.
     {
-        let state_c = state.clone();
+        let weak_state = Rc::downgrade(state);
         media.connect_timestamp_notify(move |_| {
-            update_seek_ui(&state_c);
-        });
-    }
-    {
-        let state_c = state.clone();
-        media.connect_duration_notify(move |_| {
-            update_seek_ui(&state_c);
-        });
-    }
-    {
-        let state_c = state.clone();
-        media.connect_playing_notify(move |_| {
-            update_seek_ui(&state_c);
-        });
-    }
-    {
-        let state_c = state.clone();
-        media.connect_seeking_notify(move |m| {
-            if !m.is_seeking() {
-                state_c.borrow_mut().seeking = false;
+            if let Some(s) = weak_state.upgrade() {
+                update_seek_ui(&s);
             }
-            update_seek_ui(&state_c);
+        });
+    }
+    {
+        let weak_state = Rc::downgrade(state);
+        media.connect_duration_notify(move |_| {
+            if let Some(s) = weak_state.upgrade() {
+                update_seek_ui(&s);
+            }
+        });
+    }
+    {
+        let weak_state = Rc::downgrade(state);
+        media.connect_playing_notify(move |_| {
+            if let Some(s) = weak_state.upgrade() {
+                update_seek_ui(&s);
+            }
+        });
+    }
+    {
+        let weak_state = Rc::downgrade(state);
+        media.connect_seeking_notify(move |m| {
+            let Some(s) = weak_state.upgrade() else {
+                return;
+            };
+            if !m.is_seeking() {
+                s.borrow_mut().seeking = false;
+            }
+            update_seek_ui(&s);
         });
     }
     // Error feedback (previously silent black frame).
     {
-        let state_c = state.clone();
+        let weak_state = Rc::downgrade(state);
         media.connect_error_notify(move |m| {
             if let Some(err) = m.error() {
-                debug_log(&format!("video error: {err:?}"));
-                show_toast(&state_c, "Failed to play video (missing codec?)");
+                debug_log!(format!("video error: {err:?}"));
+                if let Some(s) = weak_state.upgrade() {
+                    show_toast(&s, "Failed to play video (missing codec?)");
+                }
             }
         });
     }

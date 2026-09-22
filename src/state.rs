@@ -15,15 +15,48 @@ pub const SWIPE_PROGRESS_COMMIT: f64 = 0.25;
 /// …or past a fling velocity in the travel direction (px/ms).
 pub const SWIPE_FLING_PX_PER_MS: f64 = 0.8;
 
+/// Whether verbose logging is on (`CAROSELLO_DEBUG` set), cached on first
+/// use so [`debug_log!`] is a single check when disabled.
+pub fn debug_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("CAROSELLO_DEBUG").is_ok())
+}
+
+/// Log a message when `CAROSELLO_DEBUG` is set. A macro rather than a
+/// `fn(&str)`, so the argument expression lives *inside* the gate: with
+/// debugging off no `format!` runs and nothing allocates (the old
+/// function formatted on every call — IMPROVEMENTS #6). Import like a
+/// function (`use crate::state::debug_log;`) and call with `!`.
+macro_rules! debug_log {
+    ($e:expr) => {{
+        if $crate::state::debug_enabled() {
+            let msg = $e;
+            eprintln!("[carosello-debug] {msg}");
+        }
+    }};
+}
+pub(crate) use debug_log;
+
+/// Case-insensitive extension test without allocating: compares the
+/// original extension against each candidate (was `to_ascii_lowercase()`
+/// per check — IMPROVEMENTS, micro).
 pub fn has_ext(path: &Path, exts: &[&str]) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
-        .map(|e| exts.contains(&e.to_ascii_lowercase().as_str()))
+        .map(|e| exts.iter().any(|x| e.eq_ignore_ascii_case(x)))
         .unwrap_or(false)
 }
 
 pub fn is_media(path: &Path) -> bool {
-    has_ext(path, IMAGE_EXTS) || has_ext(path, VIDEO_EXTS)
+    // One `path.extension()` for both lists (it used to run twice).
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    IMAGE_EXTS
+        .iter()
+        .chain(VIDEO_EXTS.iter())
+        .any(|x| ext.eq_ignore_ascii_case(x))
 }
 
 /// Config dir for user preferences (`$XDG_CONFIG_HOME/carosello`,
@@ -76,30 +109,40 @@ fn parse_two_finger_swipe(text: &str) -> bool {
     false
 }
 
-/// Whether the slide animation is enabled (default true when unset or
-/// unreadable). Read from `dir/settings.conf` (tests) or the config dir.
-pub fn load_slide_enabled_from(dir: &Path) -> bool {
+/// Parse both prefs from one read of the settings text: slide animation
+/// (default on) and two-finger swipe (default off).
+fn parse_prefs(text: &str) -> (bool, bool) {
+    (parse_slide_enabled(text), parse_two_finger_swipe(text))
+}
+
+/// Read both prefs with a single `read_to_string` — startup used to read
+/// `settings.conf` twice, once per pref (IMPROVEMENTS #8). Unreadable
+/// file yields the defaults: slide on, two-finger off.
+pub fn load_prefs_from(dir: &Path) -> (bool, bool) {
     match std::fs::read_to_string(dir.join("settings.conf")) {
-        Ok(text) => parse_slide_enabled(&text),
-        Err(_) => true,
+        Ok(text) => parse_prefs(&text),
+        Err(_) => (true, false),
     }
 }
 
-pub fn load_slide_enabled() -> bool {
-    load_slide_enabled_from(&config_dir())
+pub fn load_prefs() -> (bool, bool) {
+    load_prefs_from(&config_dir())
 }
 
+// Single-pref readers for the settings tests (the app reads both prefs at
+// once via `load_prefs` — keeping them out of the binary avoids dead code).
+#[cfg(test)]
+/// Whether the slide animation is enabled (default true when unset or
+/// unreadable). Read from `dir/settings.conf` (tests).
+pub fn load_slide_enabled_from(dir: &Path) -> bool {
+    load_prefs_from(dir).0
+}
+
+#[cfg(test)]
 /// Whether two-finger (instead of three-finger) swipe is enabled
 /// (default false when unset or unreadable).
 pub fn load_two_finger_swipe_from(dir: &Path) -> bool {
-    match std::fs::read_to_string(dir.join("settings.conf")) {
-        Ok(text) => parse_two_finger_swipe(&text),
-        Err(_) => false,
-    }
-}
-
-pub fn load_two_finger_swipe() -> bool {
-    load_two_finger_swipe_from(&config_dir())
+    load_prefs_from(dir).1
 }
 
 /// Update a single `key = bool` line, preserving all other lines.
@@ -264,11 +307,11 @@ impl NatPart {
 }
 
 /// Sort media paths naturally by filename (`IMG2` before `IMG10`).
+/// `sort_by_cached_key` builds each key once (n) instead of once per
+/// comparison (n log n × 2 key builds — IMPROVEMENTS #5).
 pub fn sort_media_paths(files: &mut [PathBuf]) {
-    files.sort_by(|a, b| {
-        let an = a.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-        let bn = b.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-        natural_key(an).cmp(&natural_key(bn))
+    files.sort_by_cached_key(|p| {
+        natural_key(p.file_name().and_then(|n| n.to_str()).unwrap_or_default())
     });
 }
 
@@ -277,7 +320,7 @@ pub fn collect_media(dir: &Path) -> Vec<PathBuf> {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(err) => {
-            debug_log(&format!(
+            debug_log!(format!(
                 "collect_media: read_dir({}) failed: {err}",
                 dir.display()
             ));
@@ -290,21 +333,12 @@ pub fn collect_media(dir: &Path) -> Vec<PathBuf> {
         .filter(|p| p.is_file() && is_media(p))
         .collect();
     sort_media_paths(&mut files);
-    debug_log(&format!(
+    debug_log!(format!(
         "collect_media: {} media in {}",
         files.len(),
         dir.display()
     ));
     files
-}
-
-pub fn debug_log(msg: &str) {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    let enabled = ENABLED.get_or_init(|| std::env::var("CAROSELLO_DEBUG").is_ok());
-    if *enabled {
-        eprintln!("[carosello-debug] {msg}");
-    }
 }
 
 #[cfg(test)]
@@ -434,6 +468,26 @@ mod tests {
         save_two_finger_swipe_to(&dir, false);
         assert!(load_slide_enabled_from(&dir));
         assert!(!load_two_finger_swipe_from(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_prefs_reads_both_at_once() {
+        let dir = std::env::temp_dir().join(format!("carosello-prefs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // Missing file → defaults: slide on, two-finger off.
+        assert_eq!(load_prefs_from(&dir), (true, false));
+        save_slide_enabled_to(&dir, false);
+        save_two_finger_swipe_to(&dir, true);
+        assert_eq!(load_prefs_from(&dir), (false, true));
+        // The *_from delegates must report exactly the same pair.
+        assert_eq!(
+            (
+                load_slide_enabled_from(&dir),
+                load_two_finger_swipe_from(&dir)
+            ),
+            load_prefs_from(&dir)
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

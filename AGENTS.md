@@ -60,10 +60,38 @@
   borrow `state` again in the body: the `RefMut` temporary lives for the
   whole `if`, so the inner borrow **panics**. Split into two statements.
   Same applies to `state.borrow().field` + `ref` bindings in scrutinees.
-- `gdk_pixbuf::Pixbuf` is **not `Send`**: no `std::thread::spawn` with
-  Pixbuf/`Rc<AppState>` captures. Use GIO async (`File::read_async` +
-  `Pixbuf::from_stream_async`) — decode leaves the UI thread, everything
-  stays on the main context.
+- `gdk_pixbuf::Pixbuf` / `gdk::Texture` are **not `Send`**: no
+  `std::thread::spawn` with Pixbuf/Texture/`Rc<AppState>` captures.
+  Workers exchange plain `transform::Decoded { rgba, w, h }` bytes only
+  (see Decode / workers below); textures are built on the main context.
+
+## Decode / workers / logging
+
+- **Display decode runs on a worker `std::thread`** (`spawn_decode` /
+  `spawn_frame_worker` in `window.rs`): `std::fs::read` +
+  `transform::decode_frame` (image-crate decode + EXIF orientation baked
+  in) produce plain bytes; only the main thread wraps them in a
+  `gdk::MemoryTexture` (`frame_texture`). Never assume `*_async` GIO or
+  the old gdk-pixbuf stream callback decodes off-thread — they ran the
+  actual decompression **on the UI thread** (that was IMPROVEMENTS #1).
+- glib has no `MainContext::channel` and `idle_add` needs `Send`, so
+  workers publish into an `Arc<Mutex<Option<Result<…>>>>` slot polled by
+  `glib::timeout_add_local(Duration::from_millis(16), …)` (~30 s /
+  1875-tick deadline) — the same pattern as the transform worker.
+  Rounds are cancelled with `gio::Cancellable` (`state.decode_cancel` /
+  `state.prefetch_cancel`, superseded on every navigation) plus the
+  `image_gen` generation guard.
+- **Media/slide signal closures must capture weakly** (`Rc::downgrade
+  (&state)`, `widget.downgrade()`, `SlideCtxWeak`): `state → media_file →
+  handler → state` and `media → handler → picture → video paintable →
+  media` are real refcycles that used to leak a pipeline + widget graph
+  per video. Prefetch holds at most **2 textures FIFO** (`prefetch_store`,
+  oldest popped) and each navigation cancels the previous round; results
+  re-check the target is still index±1 before storing.
+- `debug_log` is a `macro_rules!` in `state.rs` re-exported via
+  `pub(crate) use`, imported as `use crate::state::debug_log` and called
+  with `!`: the `format!` argument lives *inside* the `debug_enabled()`
+  gate (a `fn(&str)` formatted on every call even when disabled).
 - Release profile strips symbols (`strip`, `panic=abort`); to debug a
   flatpak crash, reproduce with the dev binary + `RUST_BACKTRACE=1`
   (Wayland is available, headless launch works).

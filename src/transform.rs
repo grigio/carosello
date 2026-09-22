@@ -1,7 +1,14 @@
-//! Pure rotate/mirror pipeline: decode → EXIF-orient → transform → encode
-//! → re-inject patched EXIF. Everything works on plain byte slices and
-//! `image::DynamicImage` so it can run on a worker thread with Send data
-//! only (no `gdk_pixbuf::Pixbuf` / `Rc` — see AGENTS.md).
+//! Pure decode/transform pipeline: decode → EXIF-orient → (transform) →
+//! encode → re-inject patched EXIF. Everything works on plain byte slices
+//! and `image::DynamicImage` so it can run on a worker thread with Send
+//! data only (no `gdk_pixbuf::Pixbuf` / `Rc` — see AGENTS.md).
+//!
+//! Two entry points share this code path:
+//! [`decode_frame`] prepares pixels for *display* (the UI thread only
+//! wraps the result in a texture), [`transform_bytes`] prepares bytes to
+//! *save*. Both bake the EXIF orientation in with the same
+//! [`apply_exif_orientation`], so what the viewer shows and what it
+//! writes to disk can't diverge.
 //!
 //! Saved pixels are always display-oriented (EXIF orientation baked in),
 //! with the JPEG Orientation tag patched back to 1, so a reload shows the
@@ -33,6 +40,37 @@ pub enum Transform {
     MirrorH,
 }
 
+/// Display frame decoded off the UI thread: 8-bit RGBA, rows tightly
+/// packed (`stride = w * 4`), EXIF orientation already baked in. Plain
+/// `Send` data — the worker produces it, the main context wraps it in a
+/// `gdk::MemoryTexture` (zero-copy over `rgba`).
+pub struct Decoded {
+    pub rgba: Vec<u8>,
+    pub w: i32,
+    pub h: i32,
+}
+
+/// Decode `bytes` for display (IMPROVEMENTS #1: read + EXIF + rotate all
+/// happen on a worker thread). The format is sniffed from the content —
+/// like the gdk-pixbuf stream loader before it — and the orientation is
+/// baked in by the same code the save pipeline uses.
+pub fn decode_frame(bytes: &[u8]) -> Result<Decoded, String> {
+    let format =
+        image::guess_format(bytes).map_err(|e| format!("Cannot detect image format: {e}"))?;
+    let orientation = media::read_exif_orientation_bytes(bytes);
+    let img = image::load_from_memory_with_format(bytes, format)
+        .map_err(|e| format!("Cannot decode image: {e}"))?;
+    let img = apply_exif_orientation(&img, orientation);
+    let rgba = img.to_rgba8();
+    let w = i32::try_from(rgba.width()).map_err(|_| "Image too wide".to_string())?;
+    let h = i32::try_from(rgba.height()).map_err(|_| "Image too tall".to_string())?;
+    Ok(Decoded {
+        rgba: rgba.into_raw(),
+        w,
+        h,
+    })
+}
+
 /// Transform image `bytes` (format chosen by `ext`, e.g. `"jpg"`) and
 /// encode the result. Display-oriented pixels out, EXIF preserved for JPEG.
 pub fn transform_bytes(bytes: &[u8], ext: &str, op: Transform) -> Result<Vec<u8>, String> {
@@ -52,7 +90,7 @@ pub fn transform_bytes(bytes: &[u8], ext: &str, op: Transform) -> Result<Vec<u8>
         // None → drop EXIF rather than ship a stale Orientation tag.
         match extract_exif_app1(bytes).and_then(|p| patch_exif(p, orientation)) {
             Some(payload) => inject_exif_app1(&mut out, &payload),
-            None => debug_log("transform: no usable EXIF to preserve"),
+            None => debug_log!("transform: no usable EXIF to preserve"),
         }
     }
     Ok(out)
@@ -84,9 +122,11 @@ fn reject_animation(bytes: &[u8], format: ImageFormat) -> Result<(), String> {
     Ok(())
 }
 
-/// Bake EXIF orientation into the pixels. The match arms mirror
-/// `media::apply_orientation` (gdk-pixbuf) one for one, so what we save is
-/// what the viewer showed — keep both in sync.
+/// Bake EXIF orientation into the pixels. Used by both the display decode
+/// ([`decode_frame`]) and the save pipeline ([`transform_bytes`]), so the
+/// screen and the file always agree. `apply_orientation_reference` in the
+/// tests checks the arms against gdk-pixbuf's own implementation of the
+/// EXIF orientation semantics.
 fn apply_exif_orientation(img: &DynamicImage, orientation: u8) -> DynamicImage {
     match orientation {
         2 => img.fliph(),
@@ -319,12 +359,47 @@ mod tests {
         assert_eq!(px(&out, 1, 0), [255, 0, 0, 255]);
     }
 
-    /// EXIF orientation must bake exactly like the viewer's gdk-pixbuf path,
-    /// otherwise autosaved files differ from what was on screen.
+    /// Reference implementation of the EXIF orientation semantics, using
+    /// gdk-pixbuf itself (re-exported by gtk4 — no direct dependency). It
+    /// used to be *the* display path, so it doubles as a golden model of
+    /// what the viewer historically showed.
+    fn apply_orientation_reference(
+        pixbuf: &gtk::gdk_pixbuf::Pixbuf,
+        orientation: u8,
+    ) -> gtk::gdk_pixbuf::Pixbuf {
+        use gtk::gdk_pixbuf;
+        match orientation {
+            2 => pixbuf.flip(true).unwrap_or_else(|| pixbuf.clone()),
+            3 => pixbuf
+                .rotate_simple(gdk_pixbuf::PixbufRotation::Upsidedown)
+                .unwrap_or_else(|| pixbuf.clone()),
+            4 => pixbuf.flip(false).unwrap_or_else(|| pixbuf.clone()),
+            5 => pixbuf
+                .rotate_simple(gdk_pixbuf::PixbufRotation::Counterclockwise)
+                .and_then(|pb| pb.flip(true))
+                .unwrap_or_else(|| pixbuf.clone()),
+            6 => pixbuf
+                .rotate_simple(gdk_pixbuf::PixbufRotation::Clockwise)
+                .unwrap_or_else(|| pixbuf.clone()),
+            7 => pixbuf
+                .rotate_simple(gdk_pixbuf::PixbufRotation::Clockwise)
+                .and_then(|pb| pb.flip(true))
+                .unwrap_or_else(|| pixbuf.clone()),
+            8 => pixbuf
+                .rotate_simple(gdk_pixbuf::PixbufRotation::Counterclockwise)
+                .and_then(|pb| pb.flip(true))
+                .unwrap_or_else(|| pixbuf.clone()),
+            _ => pixbuf.clone(),
+        }
+    }
+
+    /// [`apply_exif_orientation`] must bake exactly like gdk-pixbuf's own
+    /// orientation handling — the model both the display and the save
+    /// path are checked against, so a typoed arm can't silently show (or
+    /// write) a picture rotated the wrong way.
     #[test]
-    fn test_exif_orientation_matches_viewer_pixbuf() {
-        use crate::media::apply_orientation;
-        use gdk_pixbuf::{Colorspace, Pixbuf};
+    fn test_exif_orientation_matches_gdk_pixbuf() {
+        use gtk::gdk_pixbuf::{Colorspace, Pixbuf};
         use gtk::glib;
 
         let raw: Vec<u8> = vec![
@@ -339,7 +414,7 @@ mod tests {
         );
 
         for orientation in 1u8..=8 {
-            let want = apply_orientation(&pb, orientation);
+            let want = apply_orientation_reference(&pb, orientation);
             let got = apply_exif_orientation(&img, orientation);
             assert_eq!(
                 (got.width(), got.height()),
@@ -561,6 +636,33 @@ mod tests {
         let err = transform_bytes(b"whatever", "xyz", Transform::RotateRight)
             .expect_err("unsupported ext");
         assert!(err.contains("Unsupported format"), "got: {err}");
+    }
+
+    /// The display decode must bake EXIF orientation like everything else:
+    /// a 2x1 JPEG tagged Orientation=6 (rotate 90° CW to display) decodes
+    /// as 1x2 pixels, and the format is sniffed from the bytes.
+    #[test]
+    fn test_decode_frame_bakes_exif_orientation() {
+        let img = DynamicImage::ImageRgba8(two_pixels());
+        let src = jpeg_with_exif(&encode_test_jpeg(&img), 6);
+        let frame = decode_frame(&src).expect("decode");
+        assert_eq!((frame.w, frame.h), (1, 2));
+        assert_eq!(frame.rgba.len(), (frame.w * frame.h * 4) as usize);
+        // Orientation 6 turns the left pixel (red) to the top. JPEG is
+        // lossy, so assert "red enough" rather than exact bytes (a wrongly
+        // oriented frame would put blue here, and the 1x2 size above would
+        // not hold at all).
+        let top = &frame.rgba[0..4];
+        assert!(
+            top[0] > 240 && top[1] < 16 && top[2] < 16 && top[3] == 255,
+            "top pixel should be red, got {top:?}"
+        );
+        // No EXIF at all → pixels pass through untouched (PNG sniffed).
+        let mut png = Cursor::new(Vec::new());
+        img.write_to(&mut png, ImageFormat::Png).expect("png");
+        let plain = decode_frame(&png.into_inner()).expect("decode png");
+        assert_eq!((plain.w, plain.h), (2, 1));
+        assert!(decode_frame(b"not an image").is_err());
     }
 
     /// Read the Orientation tag back out of a patched payload.
