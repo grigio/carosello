@@ -129,9 +129,19 @@
 
 ## Verify
 
-- `cargo fmt && cargo clippy --all-targets -- -D warnings && cargo test`
-  (CI runs exactly this; `-D warnings` turns the prefetch-style `dead_code`
-  and `unnecessary_sort_by` lints into failures).
+- **Pre-commit: run these before every commit/push** — `cargo fmt --check
+  && cargo clippy --all-targets -- -D warnings && cargo test`. CI is not
+  the safety net: `-D warnings` turns the prefetch-style `dead_code` /
+  `unnecessary_sort_by` lints into failures, and a red job blocks the
+  release (below).
+- **CI's "Clippy" step is currently red for an environment reason, not a
+  lint**: the `build` job installs Ubuntu-noble `libadwaita-1-dev` 1.5.0
+  while `libadwaita-sys 0.7.2` needs ≥ 1.6, so the build script exits 101
+  *before* clippy lints anything (true since v1.2.0). Local clippy on this
+  machine (newer libadwaita) is the authority. Cost: `build` never reaches
+  Build/Tests, and on tags `release` is skipped because it `needs:
+  [build, flatpak]`. The tag-only `flatpak` job (`gnome-NN` image) is
+  independent and green (verified on gnome-50).
 - Reinstall: `flatpak-builder --user --install --force-clean build-dir
   io.github.grigio.carosello.yml`
 - Smoke test headless, check stderr is empty (no panic, no GVFS warnings):
