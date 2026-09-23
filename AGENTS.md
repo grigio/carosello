@@ -60,6 +60,11 @@
   the metainfo releases). Then tag `v<ver>` and run `updpkgsums`.
 - CI `versions` job fails on any drift between Cargo / metainfo / PKGBUILD /
   .SRCINFO / git tag.
+- **`updpkgsums` reuses the cached tarball** `carosello-<ver>.tar.gz` sitting
+  in the repo dir (gitignored) instead of re-downloading, so after retagging
+  it silently keeps the *previous* hash. `rm -f carosello-*.tar.gz` first,
+  then `updpkgsums` + `makepkg --printsrcinfo > .SRCINFO`, and confirm the
+  hash against `curl -sL …/archive/refs/tags/v<ver>.tar.gz | sha256sum`.
 - **Runtime bump = 2 places**: `runtime-version: 'NN'` in the manifest and
   the CI image `ghcr.io/flathub-infra/flatpak-github-actions:gnome-NN`
   (same NN; `gnome-49/50/51` all exist on ghcr). Then
