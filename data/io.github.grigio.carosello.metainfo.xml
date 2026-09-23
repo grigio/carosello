@@ -47,6 +47,11 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="1.2.2" date="2026-09-23">
+      <description>
+        <p>Fix the touchpad double-click zoom sometimes jumping to the top-left corner, and greatly reduce skipped slide transitions when swiping: the neighbor prefetch now starts with each slide, and the frame you just left is kept for a quick swipe back.</p>
+      </description>
+    </release>
     <release version="1.2.1" date="2026-09-23">
       <description>
         <p>Escape now leaves fullscreen (it still resets the zoom when you are not in fullscreen). Move to Trash falls back to a direct delete on filesystems without a Trash, such as remote sftp/smb mounts. Built on the GNOME 50 runtime.</p>
