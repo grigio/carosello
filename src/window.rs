@@ -32,6 +32,10 @@ struct AppState {
     decode_cancel: Option<gio::Cancellable>,
     /// Cancels the current prefetch round (one round per navigation).
     prefetch_cancel: Option<gio::Cancellable>,
+    /// Path whose decoded frame currently sits in the main `picture`.
+    /// Updated only where the paintable is set, so `stash_outgoing` can
+    /// pair the outgoing texture with the right path before a replace.
+    shown_path: Option<PathBuf>,
     zoom: f64,
     media_file: Option<gtk::MediaFile>,
     video_view: ZoomPaintable,
@@ -157,6 +161,13 @@ impl AppState {
         if let Some(pos) = self.prefetch.iter().position(|(p, _)| p.as_path() == path) {
             self.prefetch.remove(pos);
         }
+        // Cache mutation reopens the round epoch: the transform re-show
+        // calls show_image directly (no show_file entry-cancel), so the
+        // guard in prefetch_neighbors must be free to start a fresh round.
+        // Take + cancel: an in-flight round may hold the dropped path.
+        if let Some(c) = self.prefetch_cancel.take() {
+            c.cancel();
+        }
     }
 
     /// Store a decoded neighbor, evicting the oldest first (FIFO — with
@@ -188,6 +199,7 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
         prefetch: VecDeque::new(),
         decode_cancel: None,
         prefetch_cancel: None,
+        shown_path: None,
         zoom: 1.0,
         media_file: None,
         video_view: ZoomPaintable::new(),
@@ -1553,43 +1565,70 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
     scrolled.add_controller(zoom_gesture);
 
     // ── Drag-to-pan when zoomed ──
+    // Incremental deltas (`off − prev`), never an absolute `start − off`
+    // origin snapshotted at press time: the press that *triggers* a
+    // double-click zoom runs while the adjustments still hold the fit
+    // range — layout grows them later and the anchor poller only positions
+    // the scroll ~100 ms after — so that origin reads (0,0), and any finger
+    // micro-motion while the button is still down then slammed the view
+    // back to the top-left corner right after `zoom-settled` ("zooms
+    // correctly, then immediately switches to top-left"; touchpad taps and
+    // trackpad presses always carry such motion, a mechanical mouse
+    // double-click does not). Shifting by the per-update delta only moves
+    // the view by real finger motion, so the just-applied anchor survives.
+    // Diagnose with CAROSELLO_DEBUG=1: `pan-begin` / `pan-update` around a
+    // `zoom-settled`.
     {
         let drag = gtk::GestureDrag::new();
         drag.set_button(1);
-        let start_h: Rc<Cell<f64>> = Rc::new(Cell::new(0.0));
-        let start_v: Rc<Cell<f64>> = Rc::new(Cell::new(0.0));
+        // Previous drag offset (GtkGestureDrag offsets are relative to the
+        // drag start): delta = off − prev. Reset on every begin so a stale
+        // origin from an earlier drag can't turn the first update into a
+        // jump.
+        let prev: Rc<Cell<(f64, f64)>> = Rc::new(Cell::new((0.0, 0.0)));
         {
-            let scrolled = scrolled.clone();
-            let start_h = start_h.clone();
-            let start_v = start_v.clone();
+            let prev = prev.clone();
             let state = state.clone();
             drag.connect_drag_begin(move |_, _, _| {
-                if state.borrow().zoom <= 1.05 {
-                    return;
+                prev.set((0.0, 0.0));
+                let z = state.borrow().zoom;
+                if z > 1.05 {
+                    debug_log!(format!("pan-begin: zoom={z:.2}"));
                 }
-                start_h.set(scrolled.hadjustment().value());
-                start_v.set(scrolled.vadjustment().value());
             });
         }
         {
             let scrolled = scrolled.clone();
-            let start_h = start_h.clone();
-            let start_v = start_v.clone();
+            let prev = prev.clone();
             let state = state.clone();
             drag.connect_drag_update(move |_, off_x, off_y| {
+                // Track the finger even while below the pan threshold, so a
+                // zoom starting mid-hold only pans the motion since here.
+                let (px, py) = prev.get();
+                prev.set((off_x, off_y));
                 if state.borrow().zoom <= 1.05 {
+                    return;
+                }
+                let dx = off_x - px;
+                let dy = off_y - py;
+                if dx == 0.0 && dy == 0.0 {
                     return;
                 }
                 let hadj = scrolled.hadjustment();
                 let vadj = scrolled.vadjustment();
-                let nx = (start_h.get() - off_x).clamp(
+                let old_h = hadj.value();
+                let old_v = vadj.value();
+                let nx = (old_h - dx).clamp(
                     hadj.lower(),
                     (hadj.upper() - hadj.page_size()).max(hadj.lower()),
                 );
-                let ny = (start_v.get() - off_y).clamp(
+                let ny = (old_v - dy).clamp(
                     vadj.lower(),
                     (vadj.upper() - vadj.page_size()).max(vadj.lower()),
                 );
+                debug_log!(format!(
+                    "pan-update: d=({dx:+.1},{dy:+.1}) h {old_h:.0}->{nx:.0} v {old_v:.0}->{ny:.0}"
+                ));
                 hadj.set_value(nx);
                 vadj.set_value(ny);
             });
@@ -3012,8 +3051,13 @@ fn drag_begin(
     scrolled: &gtk::ScrolledWindow,
 ) -> glib::Propagation {
     let (vw, vh) = viewport_size(scrolled);
-    if vw < 1.0 || vh < 1.0 || !animations_enabled(state) || state.borrow().zoom > 1.05 {
+    let z = state.borrow().zoom;
+    if vw < 1.0 || vh < 1.0 || !animations_enabled(state) || z > 1.05 {
         // Zoomed: leave it to the discrete swipe (instant cut when zoomed).
+        debug_log!(format!(
+            "drag-begin: decline vp={vw:.0}x{vh:.0} zoom={z:.2} anims={}",
+            animations_enabled(state)
+        ));
         return glib::Propagation::Proceed;
     }
     let active = { state.borrow().sliding || state.borrow().drag.is_some() };
@@ -3184,6 +3228,10 @@ fn drag_lock(state: &Rc<RefCell<AppState>>) {
         d.new_index = new_index;
         if !have_frame {
             // Uncached: track blind, the release cuts instantly.
+            debug_log!(format!(
+                "drag-lock: no frame for {} -> blind cut",
+                path.display()
+            ));
             d.visual = false;
             return;
         }
@@ -3198,6 +3246,10 @@ fn drag_lock(state: &Rc<RefCell<AppState>>) {
     let cached = state.borrow().prefetch_get(&path);
     let Some(tex) = cached else {
         // Evicted between lock and decode: track blind, release cuts.
+        debug_log!(format!(
+            "drag-lock: evicted {} -> blind cut",
+            path.display()
+        ));
         if let Some(d) = state.borrow_mut().drag.as_mut() {
             d.visual = false;
         }
@@ -3392,6 +3444,7 @@ fn drag_end(
     };
     if !d.locked {
         // Micro-gesture: reveal, no navigation.
+        debug_log!("drag-end: micro-gesture, no nav");
         abandon_slide(state, d.gen);
         return glib::Propagation::Stop;
     }
@@ -3405,6 +3458,10 @@ fn drag_end(
     }
     if !d.visual || (commit && d.is_video && !d.ready) {
         // Nothing (yet) to travel with: reveal the main view instantly.
+        debug_log!(format!(
+            "drag-end: instant reveal (visual={} commit={} video={} ready={})",
+            d.visual, commit, d.is_video, d.ready
+        ));
         abandon_slide(state, d.gen);
         return glib::Propagation::Stop;
     }
@@ -3808,8 +3865,9 @@ fn show_file(
     scrolled: &gtk::ScrolledWindow,
     window: &adw::ApplicationWindow,
 ) {
-    // A new item is coming: stop prefetching the old neighbors (videos
-    // and errors never reach prefetch_neighbors, so cancel here too).
+    // A new item is coming: supersede the old round — taking its token
+    // also opens a fresh epoch, letting the dispatch below (or the call
+    // at the end of this function) start the new round.
     cancel_prefetch(state);
     let (path, idx, total) = {
         let s = state.borrow();
@@ -3865,6 +3923,10 @@ fn show_file(
 
     // After dispatch, so is_video reflects the item just shown.
     sync_transform_buttons(state);
+    // Guarantee a round for the new index: image shows already started
+    // one (epoch guard → no-op here); videos and error paths otherwise
+    // never prefetch their neighbors at all.
+    prefetch_neighbors(state);
 }
 
 /// Attach `picture` to `scrolled` only when not already there — the
@@ -3946,6 +4008,53 @@ fn frame_texture(frame: transform::Decoded) -> gdk::Texture {
     .upcast()
 }
 
+/// Park the texture currently shown on `picture` in the prefetch cache
+/// under the path it belongs to (`shown_path`), right before the paintable
+/// is replaced with `incoming`.
+///
+/// The outgoing frame was decoded moments ago; keeping it turns the common
+/// back-and-forth into a prefetch *hit*. Without it, navigating back means
+/// a fresh worker decode — if the finger/keys get there first,
+/// `drag_lock`/`try_slide_to` fall back to the instant cut ("sometimes the
+/// slide transition is skipped": landing on an item and swiping back
+/// before its neighbor round finished decoding). The neighbor round then
+/// skips the stashed path (`prefetch_contains`), so the FIFO cap of 2
+/// still holds: [outgoing, other-neighbor].
+///
+/// Skipped when: nothing is shown yet (startup), the paintable isn't a
+/// `gdk::Texture` (video wrapper / already cleared), the same path is
+/// being re-shown (transform re-show — never cache pre-transform pixels),
+/// the old path left `files` (trash), or a transform save is in flight
+/// (same rationale as `prefetch_neighbors`).
+fn stash_outgoing(state: &Rc<RefCell<AppState>>, picture: &gtk::Picture, incoming: &Path) {
+    let Some(old) = state.borrow().shown_path.clone() else {
+        return;
+    };
+    let usable = {
+        let s = state.borrow();
+        old != *incoming
+            && !s.saving
+            && state::has_ext(&old, state::IMAGE_EXTS)
+            && s.files.iter().any(|f| f == &old)
+    };
+    if !usable {
+        return;
+    }
+    let Some(tex) = picture
+        .paintable()
+        .and_then(|p| p.downcast_ref::<gdk::Texture>().cloned())
+    else {
+        return;
+    };
+    debug_log!(format!(
+        "stash: {} ({}x{}) for back-nav",
+        old.display(),
+        tex.width(),
+        tex.height()
+    ));
+    state.borrow_mut().prefetch_store(&old, tex);
+}
+
 /// Worker delivered a decoded frame: wrap it and put it on screen.
 fn present_image(
     state: &Rc<RefCell<AppState>>,
@@ -3953,6 +4062,7 @@ fn present_image(
     scrolled: &gtk::ScrolledWindow,
     frame: transform::Decoded,
     gen: u64,
+    path: &Path,
 ) {
     if state.borrow().image_gen != gen {
         return;
@@ -3967,8 +4077,10 @@ fn present_image(
         s.image_w = w;
         s.image_h = h;
     }
+    stash_outgoing(state, picture, path);
     ensure_picture_child(scrolled, picture);
     picture.set_paintable(Some(&tex));
+    state.borrow_mut().shown_path = Some(path.to_path_buf());
     picture.set_content_fit(gtk::ContentFit::Contain);
     reset_scroll(scrolled);
     schedule_update(state, picture, scrolled);
@@ -4010,10 +4122,14 @@ fn spawn_decode(
         };
         if let Some(result) = taken {
             match result {
-                Ok(frame) => present_image(&state_c, &picture_c, &scrolled_c, frame, gen),
+                Ok(frame) => present_image(&state_c, &picture_c, &scrolled_c, frame, gen, &path_c),
                 Err(msg) => {
                     debug_log!(format!("Failed to load {}: {msg}", path_c.display()));
+                    // Keep the still-valid frame we were showing instead of
+                    // dropping it with the clear below.
+                    stash_outgoing(&state_c, &picture_c, &path_c);
                     picture_c.set_paintable(None::<&gdk::Texture>);
+                    state_c.borrow_mut().shown_path = None;
                     show_toast(
                         &state_c,
                         &format!(
@@ -4092,7 +4208,9 @@ fn show_image(
             s.image_h = h;
         }
         ensure_picture_child(scrolled, picture);
+        stash_outgoing(state, picture, &path_buf);
         picture.set_paintable(Some(&tex));
+        state.borrow_mut().shown_path = Some(path_buf.clone());
         picture.set_content_fit(gtk::ContentFit::Contain);
         reset_scroll(scrolled);
         schedule_update(state, picture, scrolled);
@@ -4101,6 +4219,12 @@ fn show_image(
     }
 
     spawn_decode(state, picture, scrolled, &path_buf, gen);
+    // Start the neighbor round NOW, in parallel with the display decode.
+    // Waiting for present_image serialized it behind the current file's
+    // decode (decode current → *then* neighbors), so the next swipe
+    // almost always beat the round — the forward-cut cascade. The epoch
+    // guard makes present_image's own call a no-op afterwards.
+    prefetch_neighbors(state);
 }
 
 /// Decode next/prev images in the background so navigation feels instant.
@@ -4115,6 +4239,14 @@ fn prefetch_neighbors(state: &Rc<RefCell<AppState>>) {
     // around the atomic replace and cache pre-transform pixels. Navigation
     // just falls back to a normal async load instead.
     if state.borrow().saving {
+        return;
+    }
+    // Epoch guard: `prefetch_cancel = Some(...)` means a round for this
+    // show already runs (started by show_image / show_file below / the
+    // fast path). Never cancel it here mid-decode and spawn duplicates —
+    // show_file's entry-cancel and prefetch_drop reopen the epoch.
+    if state.borrow().prefetch_cancel.is_some() {
+        debug_log!("prefetch: round already active, skip");
         return;
     }
     let targets: Vec<PathBuf> = {
@@ -4133,6 +4265,14 @@ fn prefetch_neighbors(state: &Rc<RefCell<AppState>>) {
     };
     // Supersede the previous round (report #3.1).
     cancel_prefetch(state);
+    debug_log!(format!(
+        "prefetch: round start ({})",
+        targets
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
     let cancel = gio::Cancellable::new();
     state.borrow_mut().prefetch_cancel = Some(cancel.clone());
 
@@ -4277,6 +4417,15 @@ fn update_display(
         if picture.paintable().is_none() {
             let zp_paintable: gdk::Paintable = zp.clone().upcast();
             picture.set_paintable(Some(&zp_paintable));
+            // Nothing to stash (the paintable was empty); just re-pair the
+            // bookkeeping with the file now on screen.
+            let cur = {
+                let s = state.borrow();
+                s.files.get(s.index).cloned()
+            };
+            if let Some(p) = cur {
+                state.borrow_mut().shown_path = Some(p);
+            }
         }
     } else {
         picture.set_content_fit(gtk::ContentFit::Contain);
@@ -4370,7 +4519,11 @@ fn show_video(
     ensure_picture_child(scrolled, picture);
     picture.set_content_fit(gtk::ContentFit::Fill);
     let zp_paintable: gdk::Paintable = zp.clone().upcast();
+    // Keep a still-displayed outgoing *image* for back-nav (the video
+    // paintable itself is not stashed — not a Texture).
+    stash_outgoing(state, picture, path);
     picture.set_paintable(Some(&zp_paintable));
+    state.borrow_mut().shown_path = Some(path.to_path_buf());
     scrolled.hadjustment().set_value(0.0);
     scrolled.vadjustment().set_value(0.0);
     schedule_update(state, picture, scrolled);

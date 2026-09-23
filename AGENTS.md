@@ -203,6 +203,52 @@
   `mouse_x/mouse_y` (overlay coords == viewport coords, same as the pinch
   path); touch (no cursor) keeps event coords + `compute_point`. Diagnose
   with `CAROSELLO_DEBUG=1`: the `dblclick: press=… cursor=…` line shows both.
+- The pan `GestureDrag` must use **incremental deltas** (`off − prev`),
+  never an absolute `start − off` origin recorded at press time: the press
+  that triggers a double-click zoom lands while the adjustments still hold
+  the fit range (layout grows them later, the anchor poller positions the
+  scroll ~100 ms after), so that origin reads (0,0) and any finger
+  micro-motion while the button is still down snapped the view back to the
+  top-left right after `zoom-settled` — "zooms correctly, then immediately
+  switches to top-left" (touchpad taps/trackpad presses always carry such
+  motion; a mechanical mouse double-click doesn't). Diagnose with
+  `CAROSELLO_DEBUG=1`: `pan-begin` / `pan-update` around a `zoom-settled`.
+- If `zoom-settled` proves the anchor math right but the view still jumps,
+  audit the **silent** `set_value` writers: the zoomed scroll-pan idle
+  (`dx*20`, unlogged) and `reset_scroll` (silent itself, though every
+  caller logs: nav / try_slide / commit_index / Home / End).
+  `scroll-swipe: settle` belongs to the *nav* drag (`state.drag`), not the
+  pan `GestureDrag` — two different drags.
+- Controllers fire **target-first**: the double-click's `GestureClick` (on
+  `picture`) runs before the pan `GestureDrag` (on `scrolled`), so
+  `pan-begin` already sees the *new* zoom while the adjustments still hold
+  the old fit range — that mismatch is the bug above.
+
+## Slide navigation (prefetch / cuts)
+
+- Images animate **only on a prefetch hit** (`try_slide_to`, `drag_lock`);
+  a miss falls back to an instant cut — the "sometimes the slide
+  transition is skipped" symptom. All cut branches now log: `drag-lock:
+  no frame/evicted … -> blind cut`, `drag-end: instant reveal`,
+  `drag-begin: decline …`, and `drag-end: micro-gesture, no nav`. A blind
+  miss re-logs once per finger-move (the branch sets no `new_pic`, so the
+  re-entry guard never trips) — repeated lines are one gesture, not many.
+- `stash_outgoing` parks the outgoing main-view texture in the prefetch
+  FIFO (cap 2) before every paintable replace; `shown_path` pairs path ↔
+  texture (updated only where the paintable is set). This makes
+  back-navigation a hit instead of a fresh decode. Never stash the same
+  path (transform re-show ⇒ pre-transform pixels) or while `saving`.
+- The neighbor round starts **at show** (`show_image` slow branch +
+  `show_file` end, fast path too), never only at `present_image`:
+  waiting serialized decode-current → decode-neighbors, so forward
+  swipes beat the round every time (the forward-cut cascade).
+  `prefetch_cancel = Some` **is** the epoch marker: `prefetch_neighbors`
+  early-returns while set; `show_file` entry (take+cancel) and
+  `prefetch_drop` (transform re-show calls `show_image` directly, no
+  entry-cancel) reopen it; `present_image`'s own call then only covers
+  the `saving`-blocked case. Remaining misses are still decode latency
+  (no `prefetch <path>: …` error line ⇒ still decoding; the debug build
+  decodes 9 MP JPEGs several times slower than release).
 
 ## GUI automation (interactive tests on this machine)
 
