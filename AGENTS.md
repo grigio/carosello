@@ -134,14 +134,16 @@
   the safety net: `-D warnings` turns the prefetch-style `dead_code` /
   `unnecessary_sort_by` lints into failures, and a red job blocks the
   release (below).
-- **CI's "Clippy" step is currently red for an environment reason, not a
-  lint**: the `build` job installs Ubuntu-noble `libadwaita-1-dev` 1.5.0
-  while `libadwaita-sys 0.7.2` needs ≥ 1.6, so the build script exits 101
-  *before* clippy lints anything (true since v1.2.0). Local clippy on this
-  machine (newer libadwaita) is the authority. Cost: `build` never reaches
-  Build/Tests, and on tags `release` is skipped because it `needs:
-  [build, flatpak]`. The tag-only `flatpak` job (`gnome-NN` image) is
-  independent and green (verified on gnome-50).
+- **CI's `build` job must keep `container: ubuntu:26.04`**: the bare
+  ubuntu-noble runner has libadwaita 1.5.0 while `Cargo.toml` selects the
+  libadwaita `v1_6` feature, so `libadwaita-sys`' build script exits 101
+  *inside the Clippy step* — it looks like a lint failure but nothing was
+  linted, Build/Tests never run, and on tags `release` is skipped with
+  them (`needs: [build, flatpak]`). The container has libadwaita 1.9.x,
+  runs as **root** (no `sudo`) and has **no toolchain** (Rust comes from
+  `dtolnay/rust-toolchain@stable`, components `rustfmt, clippy`). The
+  tag-only `flatpak` job (`gnome-NN` image) is independent — green on
+  gnome-50.
 - Reinstall: `flatpak-builder --user --install --force-clean build-dir
   io.github.grigio.carosello.yml`
 - Smoke test headless, check stderr is empty (no panic, no GVFS warnings):

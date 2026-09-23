@@ -35,16 +35,33 @@ jobs:
 
   build:
     runs-on: ubuntu-latest
+    # NOT the bare runner image: ubuntu-noble ships libadwaita 1.5.0 while
+    # Cargo.toml selects the libadwaita "v1_6" feature, so libadwaita-sys'
+    # build script exits 101 *inside the Clippy step* (looks like a lint
+    # failure, is not one — Build/Tests are then skipped and `release` is
+    # skipped with them). The 26.04 container has libadwaita 1.9.x.
+    container: ubuntu:26.04
     steps:
       - uses: actions/checkout@v5
 
+      # Root inside the container: no sudo, and no toolchain preinstalled.
       - name: Install dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            build-essential \
+            pkg-config \
+            curl \
+            git \
+            ca-certificates \
             libgtk-4-dev \
             libadwaita-1-dev \
             gettext
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
 
       - name: Check formatting
         run: cargo fmt --check
