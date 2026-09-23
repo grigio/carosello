@@ -80,7 +80,8 @@ struct AppState {
     /// A transform is being computed or written to disk; blocks new
     /// transforms and Move to Trash until the write completes.
     saving: bool,
-    /// A `trash_async` request is in flight (blocks a second one).
+    /// A `trash_async`/`delete_async` request is in flight (blocks a
+    /// second one; the delete is the no-Trash fallback of the trash).
     trashing: bool,
     /// Last state pushed to the seek bar/labels — `(ts_s, dur_s, bar_unit,
     /// playing, seeking)`; `update_seek_ui` early-outs when unchanged
@@ -1111,7 +1112,7 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
             // Using AlertDialog keeps compatibility with libadwaita 1.5 bindings
             let dlg = adw::AlertDialog::builder()
                 .heading("Keyboard Shortcuts")
-                .body("Navigation:\n  ← / →, Page Up / Down  —  Previous / Next\n  Home / End  —  First / Last\n  3-finger swipe (2-finger if enabled in Preferences)  —  Previous / Next\n\nZoom:\n  Ctrl + + / −  —  Zoom In / Out\n  Ctrl + 0  —  Reset Zoom\n  Ctrl + Scroll  —  Zoom\n  Pinch  —  Zoom\n  Double-click  —  Toggle 2.5×\n  Drag  —  Pan when zoomed\n\nView:\n  F11 / F  —  Fullscreen\n  Esc  —  Reset Zoom\n\nVideo:\n  Space / K  —  Play / Pause\n  M  —  Mute\n  [ / ]  —  Seek 5 s\n  Click seek bar  —  Seek\n\nFile:\n  Del  —  Move to Trash\n\nApplication:\n  Ctrl + O  —  Open File\n  Ctrl + Shift + O  —  Open Folder\n  Ctrl + Q  —  Quit\n  Ctrl + W  —  Close\n  Ctrl + ? / Ctrl + K  —  This Help\n  F1  —  About")
+                .body("Navigation:\n  ← / →, Page Up / Down  —  Previous / Next\n  Home / End  —  First / Last\n  3-finger swipe (2-finger if enabled in Preferences)  —  Previous / Next\n\nZoom:\n  Ctrl + + / −  —  Zoom In / Out\n  Ctrl + 0  —  Reset Zoom\n  Ctrl + Scroll  —  Zoom\n  Pinch  —  Zoom\n  Double-click  —  Toggle 2.5×\n  Drag  —  Pan when zoomed\n\nView:\n  F11 / F  —  Fullscreen\n  Esc  —  Exit Fullscreen, else Reset Zoom\n\nVideo:\n  Space / K  —  Play / Pause\n  M  —  Mute\n  [ / ]  —  Seek 5 s\n  Click seek bar  —  Seek\n\nFile:\n  Del  —  Move to Trash (or delete it when there is no Trash)\n\nApplication:\n  Ctrl + O  —  Open File\n  Ctrl + Shift + O  —  Open Folder\n  Ctrl + Q  —  Quit\n  Ctrl + W  —  Close\n  Ctrl + ? / Ctrl + K  —  This Help\n  F1  —  About")
                 .build();
             dlg.add_response("close", "Close");
             dlg.set_close_response("close");
@@ -1250,7 +1251,14 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
                 zoom_to(&state, &picture, &scrolled, 1.0, None);
                 glib::Propagation::Stop
             }
+            // Escape: leave fullscreen first (standard viewer behaviour),
+            // otherwise reset the zoom, otherwise let it bubble (e.g. dialogs).
             gdk::Key::Escape => {
+                if window.is_fullscreen() {
+                    debug_log!("fullscreen-exit: key Escape");
+                    window.set_fullscreened(false);
+                    return glib::Propagation::Stop;
+                }
                 let z = state.borrow().zoom;
                 if (z - 1.0).abs() > 0.01 {
                     debug_log!("zoom-reset: key Escape");
@@ -3449,6 +3457,11 @@ fn drag_end(
 ///
 /// The index is NOT reset: after removal the next file slides into the
 /// same index (or the previous one if the last item was trashed).
+///
+/// When the filesystem has no Trash at all (`G_IO_ERROR_NOT_SUPPORTED`:
+/// remote gvfs mounts such as sftp, system-internal mounts like `/tmp`,
+/// the document portal) the file is deleted in place instead — see
+/// [`delete_current`].
 fn trash_current(
     state: &Rc<RefCell<AppState>>,
     picture: &gtk::Picture,
@@ -3487,44 +3500,124 @@ fn trash_current(
     let picture_c = picture.clone();
     let scrolled_c = scrolled.clone();
     let window_c = window.clone();
+    let path_c = path.clone();
     file.trash_async(
         glib::Priority::DEFAULT,
         None::<&gio::Cancellable>,
         move |res| {
             state_c.borrow_mut().trashing = false;
-            if let Err(e) = res {
-                debug_log!(format!("trash failed for {}: {e}", path.display()));
-                if is_doc_portal_path(&path) {
-                    show_toast(
-                        &state_c,
-                        "Cannot move to Trash from sandbox portal — use the Files app",
-                    );
-                } else {
-                    show_toast(&state_c, &format!("Cannot move {name} to Trash"));
+            match res {
+                Ok(()) => finish_removal(
+                    &state_c,
+                    &picture_c,
+                    &scrolled_c,
+                    &window_c,
+                    &path_c,
+                    &format!("Moved {name} to Trash"),
+                ),
+                Err(e) => {
+                    debug_log!(format!("trash failed for {}: {e}", path_c.display()));
+                    // "There is no Trash here" — verified to be
+                    // G_IO_ERROR_NOT_SUPPORTED on a remote sftp mount
+                    // ("Operation not supported") and on /tmp ("Trashing
+                    // on system internal mounts is not supported").
+                    if matches!(e.kind(), Some(gio::IOErrorEnum::NotSupported)) {
+                        delete_current(&state_c, &picture_c, &scrolled_c, &window_c, path_c, name);
+                        return;
+                    }
+                    if is_doc_portal_path(&path_c) {
+                        show_toast(
+                            &state_c,
+                            "Cannot move to Trash from sandbox portal — use the Files app",
+                        );
+                    } else {
+                        show_toast(&state_c, &format!("Cannot move {name} to Trash"));
+                    }
                 }
-                return;
-            }
-
-            // (Two statements: the position lookup must finish before the
-            // mutable borrow below, else RefCell panics.)
-            let pos = state_c.borrow().files.iter().position(|f| f == &path);
-            cancel_slide(&state_c);
-            {
-                let mut s = state_c.borrow_mut();
-                if let Some(pos) = pos {
-                    s.files.remove(pos);
-                    s.prefetch_drop(&path);
-                    s.index = state::index_after_removal(s.files.len(), s.index, pos);
-                    s.zoom = 1.0;
-                }
-            }
-            reset_scroll(&scrolled_c);
-            show_file(&state_c, &picture_c, &scrolled_c, &window_c);
-            if !state_c.borrow().files.is_empty() {
-                show_toast(&state_c, &format!("Moved {name} to Trash"));
             }
         },
     );
+}
+
+/// Delete the current file permanently — the fallback used when the
+/// filesystem offers no Trash ([`trash_current`], `NOT_SUPPORTED`).
+///
+/// Reuses the `trashing` guard so a second Del cannot race the first,
+/// and ends in the same [`finish_removal`] tail as a successful trash.
+fn delete_current(
+    state: &Rc<RefCell<AppState>>,
+    picture: &gtk::Picture,
+    scrolled: &gtk::ScrolledWindow,
+    window: &adw::ApplicationWindow,
+    path: PathBuf,
+    name: String,
+) {
+    let file = gio::File::for_path(&path);
+    state.borrow_mut().trashing = true;
+    let state_c = state.clone();
+    let picture_c = picture.clone();
+    let scrolled_c = scrolled.clone();
+    let window_c = window.clone();
+    file.delete_async(
+        glib::Priority::DEFAULT,
+        None::<&gio::Cancellable>,
+        move |res| {
+            state_c.borrow_mut().trashing = false;
+            match res {
+                Ok(()) => finish_removal(
+                    &state_c,
+                    &picture_c,
+                    &scrolled_c,
+                    &window_c,
+                    &path,
+                    &format!("Deleted {name} (no Trash here)"),
+                ),
+                Err(e) => {
+                    debug_log!(format!("delete failed for {}: {e}", path.display()));
+                    if is_doc_portal_path(&path) {
+                        show_toast(
+                            &state_c,
+                            "Cannot delete from sandbox portal — use the Files app",
+                        );
+                    } else {
+                        show_toast(&state_c, &format!("Cannot delete {name}"));
+                    }
+                }
+            }
+        },
+    );
+}
+
+/// Shared tail of a successful trash/delete: drop the entry from the
+/// list, reindex, show the next sibling and toast `msg`.
+///
+/// The index is NOT reset (see [`trash_current`]).
+fn finish_removal(
+    state: &Rc<RefCell<AppState>>,
+    picture: &gtk::Picture,
+    scrolled: &gtk::ScrolledWindow,
+    window: &adw::ApplicationWindow,
+    path: &Path,
+    msg: &str,
+) {
+    // (Two statements: the position lookup must finish before the
+    // mutable borrow below, else RefCell panics.)
+    let pos = state.borrow().files.iter().position(|f| f == path);
+    cancel_slide(state);
+    {
+        let mut s = state.borrow_mut();
+        if let Some(pos) = pos {
+            s.files.remove(pos);
+            s.prefetch_drop(path);
+            s.index = state::index_after_removal(s.files.len(), s.index, pos);
+            s.zoom = 1.0;
+        }
+    }
+    reset_scroll(scrolled);
+    show_file(state, picture, scrolled, window);
+    if !state.borrow().files.is_empty() {
+        show_toast(state, msg);
+    }
 }
 
 /// Worker result of a transform: encoded bytes plus the original file mode

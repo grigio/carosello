@@ -4,8 +4,12 @@
 
 - GVfs needs **both** entries in `finish-args`, otherwise every `GFile`
   call logs `GVFS-WARNING ... missing --filesystem=xdg-run/gvfsd privileges`:
-  `--filesystem=xdg-run/gvfs:ro` (mount points) +
+  `--filesystem=xdg-run/gvfs` (mount points, **read-write**) +
   `--filesystem=xdg-run/gvfsd` (daemon sockets, no `:ro`).
+  `:ro` remounts the gvfs mount read-only inside the sandbox, which
+  breaks the Move to Trash fallback (direct delete on filesystems with
+  no Trash: sftp/smb return `G_IO_ERROR_NOT_SUPPORTED`, code 15) and
+  in-place transforms on remote mounts.
 - `--filesystem=host:rw` lets `read_dir(parent)` list siblings of an
   opened file. Narrower grants break sibling navigation. Read-write (not
   `:ro`) is required so Move to Trash (`GFile` trash) can delete.
@@ -19,6 +23,9 @@
     `host:rw`.
   - `is_doc_portal_path()` detects portal paths; `show_file()` toasts a
     hint instead of failing silently.
+  - Portal exports are **ephemeral**: `doc/<id>` goes stale the moment the
+    exporting app closes (`gio info` → "No such file or directory").
+    Never reuse an old id for the portal smoke test — re-export.
 - **Sandboxed drag-and-drop also arrives via the portal**: drops from Files
   come as `file:///run/user/1000/doc/<unique-id>/<name>`, each file in its
   **own** id dir — parent listing can never find siblings. The drop handler
@@ -53,6 +60,14 @@
   the metainfo releases). Then tag `v<ver>` and run `updpkgsums`.
 - CI `versions` job fails on any drift between Cargo / metainfo / PKGBUILD /
   .SRCINFO / git tag.
+- **Runtime bump = 2 places**: `runtime-version: 'NN'` in the manifest and
+  the CI image `ghcr.io/flathub-infra/flatpak-github-actions:gnome-NN`
+  (same NN; `gnome-49/50/51` all exist on ghcr). Then
+  `flatpak install --user flathub org.gnome.Platform//NN org.gnome.Sdk//NN`.
+  `sdk-extensions: rust-stable` resolves against the **freedesktop** SDK
+  branch underneath GNOME, *not* GNOME's number: GNOME 50 → freedesktop
+  25.08 → `rust-stable//25.08`. There is no `rust-stable//50` — asking
+  for it fails with "Can't find ref".
 
 ## Panics / RefCell
 
@@ -95,6 +110,22 @@
 - Release profile strips symbols (`strip`, `panic=abort`); to debug a
   flatpak crash, reproduce with the dev binary + `RUST_BACKTRACE=1`
   (Wayland is available, headless launch works).
+
+## Move to Trash / delete fallback
+
+- "This filesystem has no Trash" is always `G_IO_ERROR_NOT_SUPPORTED`
+  (code 15, `matches!(e.kind(), Some(gio::IOErrorEnum::NotSupported))`) —
+  verified on a remote gvfs sftp mount (`Operation not supported`) and on
+  `/tmp` (`Trashing on system internal mounts is not supported`). Every
+  other trash error keeps the old toast; only code 15 falls through to
+  `delete_current` (`delete_async`), and both success paths share
+  `finish_removal` (drop entry → `index_after_removal` → `show_file`).
+- Probe trash support **without the GUI**: `gio trash <file>` prints the
+  message, or `python3` + `Gio.File.new_for_path(p).trash(None)` gives
+  `e.code`/`e.domain` (PyGObject errors have `.code`, not `.gerror`).
+  There is no `gio delete` — it's `gio remove`.
+- `state.trashing` guards *both* phases: `delete_current` re-arms it, so a
+  second Del during the fallback is still ignored.
 
 ## Verify
 
@@ -176,3 +207,10 @@
 - `wtype -k Left` sends keys (window must be focused). Kill the app with
   `pkill -x carosello` — `pkill -f <path/pattern>` also matches your own
   shell's command line and kills the test script mid-flight.
+- **Screenshots lie, logs don't**: labwc raises other windows (htop,
+  Chromium) over Carosello between two `grim` shots, so a "window
+  vanished" PNG proves nothing. Close the loop with
+  `pgrep -cx carosello` + the `CAROSELLO_DEBUG=1` lines around every key
+  (`fullscreen-exit: key Escape`, `trash failed for …`) instead — a
+  launched window does take keyboard focus, so `wtype -k F11/Escape/
+  Delete` reaches it without a click.

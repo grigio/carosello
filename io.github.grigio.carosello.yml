@@ -31,7 +31,12 @@ finish-args:
   # Both entries are needed: gvfs holds the mount points, gvfsd the
   # daemon sockets (without it every GFile call logs a GVFS-WARNING
   # about missing --filesystem=xdg-run/gvfsd privileges).
-  - --filesystem=xdg-run/gvfs:ro
+  # Read-write, not :ro: with :ro the mount is remounted ro inside the
+  # sandbox ("Read-only file system"), so Move to Trash — which falls
+  # back to a direct delete on filesystems without a Trash (sftp/smb
+  # report G_IO_ERROR_NOT_SUPPORTED) — and in-place transforms both fail
+  # there. host:rw does not cover /run/user/1000/gvfs.
+  - --filesystem=xdg-run/gvfs
   - --filesystem=xdg-run/gvfsd
   - --talk-name=org.gtk.vfs
   - --talk-name=org.gtk.vfs.*

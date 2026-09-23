@@ -146,14 +146,14 @@ gio mime image/jpeg io.github.grigio.carosello.desktop
 | `+` / `=` / `Ctrl++` | Zoom in |
 | `-` / `_` / `Ctrl+-` | Zoom out |
 | `0` / `Ctrl+0` | Reset zoom to fit |
-| `Escape` | Reset zoom (if zoomed) |
+| `Escape` | Exit fullscreen, else reset zoom (if zoomed) |
 | `Double-click` | Toggle between fit and 2.5x zoom |
 
 ### View
 
 | Key | Action |
 |-----|--------|
-| `F11` / `F` | Toggle fullscreen |
+| `F11` / `F` | Toggle fullscreen (also exits with `Escape`) |
 
 ### Application
 
@@ -161,6 +161,7 @@ gio mime image/jpeg io.github.grigio.carosello.desktop
 |-----|--------|
 | `Ctrl+Q` | Quit |
 | `Ctrl+W` | Close window |
+| `Delete` | Move to Trash (deletes directly when the fs has no Trash) |
 | `F1` | About |
 
 ### Video Controls
