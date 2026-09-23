@@ -65,6 +65,12 @@
   it silently keeps the *previous* hash. `rm -f carosello-*.tar.gz` first,
   then `updpkgsums` + `makepkg --printsrcinfo > .SRCINFO`, and confirm the
   hash against `curl -sL …/archive/refs/tags/v<ver>.tar.gz | sha256sum`.
+- **makepkg's `$srcdir` is `src/`** — same dir as the Rust sources: a
+  `makepkg` run leaves an untracked `src/carosello-*/` (~1.5 GB build tree)
+  plus a tarball entry (both gitignored now). `rm -rf src/carosello-*`
+  after installing; never `git add -A` right after a package build.
+  `makepkg -si` also stops at pacman's `[Y/n]` prompt in a non-TTY shell —
+  pass `--noconfirm` (or `pacman -U --noconfirm carosello-*.pkg.tar.zst`).
 - **Runtime bump = 2 places**: `runtime-version: 'NN'` in the manifest and
   the CI image `ghcr.io/flathub-infra/flatpak-github-actions:gnome-NN`
   (same NN; `gnome-49/50/51` all exist on ghcr). Then

@@ -5,6 +5,9 @@
 /pkg
 *.pkg.tar.zst*
 /carosello-*.tar.gz
+# makepkg leftovers: its $srcdir is src/ (collides with the Rust src/)
+/src/carosello-*/
+/src/*.tar.gz
 .cargo/
 cargo/vendored
 cargo-sources.json
