@@ -164,3 +164,12 @@ jobs:
           files: |
             artifacts/carosello-linux-x86_64/carosello
             artifacts/carosello-${{ github.ref_name }}-x86_64.flatpak/carosello.flatpak
+
+      # Run after the release exists; a separate `on: release` workflow would
+      # not be triggered by the GITHUB_TOKEN-created release above.
+      - name: Notify FlatPark
+        continue-on-error: true
+        uses: flatpark/publish-action@b67fca1b80b095541bc011967e0a35292bed14d8 # v1
+        with:
+          app-id: io.github.grigio.carosello
+          tag: ${{ github.ref_name }}
