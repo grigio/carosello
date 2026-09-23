@@ -1,0 +1,28 @@
+# SPDX-FileCopyrightText: 2026 grigio
+# SPDX-License-Identifier: 0BSD
+From: grigio <https://github.com/grigio>
+Subject: [PATCH] build-aux: make Cargo builds reproducible
+
+Cargo already ships the release lockfile, so make the Meson build fail
+instead of silently changing dependency versions when it is inconsistent.
+The package fetches dependencies during prepare(), so the build can also
+run fully offline. Keep compiler paths stable and use grep's end-of-options
+marker while detecting the release profile.
+
+--- a/build-aux/cargo.sh
++++ b/build-aux/cargo.sh
+@@ -3,0 +4,5 @@
++
++# Keep compiler diagnostics and panic metadata free of machine-specific paths.
++SOURCE_DIR="$(cd "$2" && pwd)"
++CARGO_DIR="$(cd "$CARGO_HOME" 2>/dev/null && pwd || printf '%s' "$CARGO_HOME")"
++export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$SOURCE_DIR=/build/carosello --remap-path-prefix=$CARGO_DIR=/build/cargo"
+@@ -18 +23 @@
+-cargo build "${@:4}" || exit 1
++cargo build --frozen --locked "${@:4}" || exit 1
+@@ -22 +27 @@
+-  if echo "$@" | grep -q "\-\-release"; then
++  if echo "$@" | grep -q -- "--release"; then
+@@ -28 +33 @@
+-  if echo "$@" | grep -q "\-\-release"; then
++  if echo "$@" | grep -q -- "--release"; then

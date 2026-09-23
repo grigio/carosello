@@ -45,17 +45,17 @@ paru -S carosello
 Without a helper:
 
 ```bash
-git clone https://github.com/grigio/carosello.git
+git clone https://aur.archlinux.org/carosello.git
 cd carosello
-BUILDDIR=/tmp/makepkg makepkg -si
+makepkg -si
 ```
 
-(`BUILDDIR` keeps makepkg's `src/`/`pkg/` scratch dirs out of the repo
-tree, which already contains a tracked `src/`.)
+The AUR checkout contains the Arch packaging recipe and builds the
+upstream release source.
 
 The `PKGBUILD` builds with Meson + Cargo (`arch-meson build && meson compile -C build`)
 and installs the binary, desktop entry, AppStream metadata, and icons.
-`depends`: `gtk4`, `libadwaita`, `glib2`, `gdk-pixbuf2`, `hicolor-icon-theme`.
+`depends`: `gtk4`, `libadwaita`, `glib2`, `graphene`, `glibc`, `libgcc`, `hicolor-icon-theme`.
 Video codecs come via GStreamer (`gst-plugins-good/bad/ugly`, `gst-libav` as optdepends).
 
 ### Flatpak (recommended)

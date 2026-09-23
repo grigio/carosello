@@ -2,6 +2,11 @@
 
 export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
 
+# Keep compiler diagnostics and panic metadata free of machine-specific paths.
+SOURCE_DIR="$(cd "$2" && pwd)"
+CARGO_DIR="$(cd "$CARGO_HOME" 2>/dev/null && pwd || printf '%s' "$CARGO_HOME")"
+export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$SOURCE_DIR=/build/carosello --remap-path-prefix=$CARGO_DIR=/build/cargo"
+
 # Parse --target-dir from args
 TARGET_DIR=""
 for arg in "$@"; do
@@ -19,13 +24,13 @@ cargo build "${@:4}" || exit 1
 
 # Determine binary location
 if [ -n "$TARGET_DIR" ]; then
-  if echo "$@" | grep -q "\-\-release"; then
+  if echo "$@" | grep -q -- "--release"; then
     BINARY="$TARGET_DIR/release/$1"
   else
     BINARY="$TARGET_DIR/debug/$1"
   fi
 else
-  if echo "$@" | grep -q "\-\-release"; then
+  if echo "$@" | grep -q -- "--release"; then
     BINARY="$2/target/release/$1"
   else
     BINARY="$2/target/debug/$1"
