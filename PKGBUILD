@@ -21,7 +21,7 @@ optdepends=(
 )
 source=("$pkgname-$pkgver.tar.gz::https://github.com/grigio/carosello/archive/refs/tags/v$pkgver.tar.gz")
 # Upstream tarballs change per release; update with `updpkgsums` after tagging.
-sha256sums=('6ff0009dfea9061d501830585249021a056d556dcf8a94ff8f441913b1c4fd95')
+sha256sums=('3fcb07056fadd2b0ae4af325516fb3254b4767fbaaf53c63b24feb1f46284476')
 
 build() {
   cd "$pkgname-$pkgver"
