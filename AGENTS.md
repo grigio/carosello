@@ -80,6 +80,45 @@
   25.08 → `rust-stable//25.08`. There is no `rust-stable//50` — asking
   for it fails with "Can't find ref".
 
+## Nix / flake
+
+- `flake.nix` + `nix/package.nix` build **the flake's own source tree**
+  (`src = ./.`) and read `version` from `Cargo.toml`
+  (`builtins.fromTOML`) ⇒ a release needs *no* flake edit. Only
+  `flake.lock` (the single nixpkgs input) moves: the
+  `Update flake.lock` workflow runs `nix flake update`, **builds the
+  result**, and only then lets `DeterminateSystems/update-flake-lock` open
+  the PR. That ordering matters: PRs created with the default
+  `GITHUB_TOKEN` don't trigger the `Nix` workflow (GitHub's recursion
+  guard), so a lock bump must be verified *before* the PR exists —
+  otherwise a broken nixpkgs bump sits there looking green. The PR is then
+  squash-merged automatically (`gh pr merge --auto`; the repo flag
+  `allow_auto_merge` is on — closing a PR cancels its auto-merge).
+- Vendoring = `rustPlatform.importCargoLock` + `rustPlatform.cargoSetupHook`.
+  The hook writes `.cargo/config.toml` at the build root (`/build`), which
+  cargo finds by walking up from meson's `build/` dir, so the
+  `CARGO_HOME=<builddir>/cargo-home` override in `build-aux/cargo.sh` is
+  harmless. `Cargo.lock` has no git deps ⇒ no `outputHashes` to maintain,
+  and `cargoSetupPostPatchHook` already diffs the lock against the vendored
+  copy (catches lock drift at build time).
+- `postPatch` does two things meson needs inside the sandbox:
+  `patchShebangs build-aux` (meson execs `cargo.sh`/`postinstall.py`
+  directly; `#!/bin/bash` and `/usr/bin/env python3` don't exist there) and
+  renames `gtk-update-icon-cache` → `gtk4-update-icon-cache` in
+  `postinstall.py` (GTK4's binary name — same trick as nixpkgs'
+  apostrophe/blackbox-terminal). `desktop-file-utils` is there for
+  `update-desktop-database` (the `.desktop` declares `MimeType=`), `libxml2`
+  for the gresource `xml-stripblanks` step.
+- Don't hand-add `gappsWrapperArgs+=(--prefix GST_PLUGIN_SYSTEM_PATH_1_0 …)`:
+  gstreamer's setup hook exports that variable and `wrapGAppsHook4`'s
+  `gappsWrapperArgsHook` already bakes it into the wrapper (duplicates it
+  otherwise).
+- Verify: `NIX_CONFIG='experimental-features = nix-command flakes' nix build`
+  then `timeout 10 ./result/bin/carosello ~/Pictures/Screenshots` — stderr
+  must be empty (same rule as the flatpak smoke test), and `nix flake check`
+  for eval. `/result` is gitignored. On this machine the daemon socket had
+  to be enabled once: `sudo systemctl enable --now nix-daemon.socket`.
+
 ## Panics / RefCell
 
 - Never `if let Some(x) = state.borrow_mut().map.remove(k)` and then

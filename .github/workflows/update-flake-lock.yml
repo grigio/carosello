@@ -1,0 +1,57 @@
+name: Update flake.lock
+
+# The only input is nixpkgs; this bumps it weekly so the package keeps
+# building against a current GTK/libadwaita/GStreamer without any manual
+# maintenance. The package itself needs no per-release work: it builds the
+# flake's own source tree and reads the version from Cargo.toml.
+on:
+  workflow_dispatch: # manual trigger from the Actions tab
+  schedule:
+    # Weekly, Monday 04:17 UTC — off the usual Sunday-midnight stampede.
+    - cron: '17 4 * * 1'
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update flake.lock
+        run: nix flake update
+
+      # PRs opened with the default GITHUB_TOKEN don't trigger other
+      # workflows (GitHub's recursion guard), so the update PR would never
+      # run the Nix build job. Verify the new inputs *here*, before the PR
+      # is opened: if the bump breaks the build, this job fails instead of
+      # opening a PR that looks green.
+      - name: Build with the updated inputs
+        run: nix build --print-build-logs
+
+      # The action runs `nix flake update` again (now a no-op) and opens the
+      # PR with the already-verified flake.lock.
+      - name: Open pull request
+        id: update-pr
+        uses: DeterminateSystems/update-flake-lock@main
+        with:
+          pr-title: "Update Nix flake inputs"
+          commit-msg: "flake.lock: update nixpkgs"
+
+      # Zero-touch: the lock was build-verified in the step above, so ask
+      # GitHub to squash-merge the PR as soon as its own mergeability check
+      # passes (there are no required checks on it). Empty output when the
+      # lock was already current — nothing to merge, nothing to fail.
+      - name: Enable auto-merge
+        if: steps.update-pr.outputs.pull-request-number != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh pr merge --auto --squash "${{ steps.update-pr.outputs.pull-request-number }}"

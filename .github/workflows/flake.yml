@@ -1,0 +1,30 @@
+name: Nix
+
+# Builds the flake package on every push/PR so the flake can never rot
+# silently (a broken flake.nix, an incompatible nixpkgs bump, a Cargo.lock
+# that importCargoLock can no longer vendor — all fail here).
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+
+      # packages.default, so `nix run github:grigio/carosello` keeps working.
+      - name: Build package
+        run: nix build --print-build-logs
+
+      # The package is also exposed under `checks`, so this re-uses the build
+      # above and additionally validates the flake's structure/eval.
+      - name: Run flake checks
+        run: nix flake check --print-build-logs

@@ -125,6 +125,22 @@ folders, edit images in place, and use Trash where supported. A single file
 opened through the document portal contains only that file; use **Open Folder…**
 to export a directory and browse its siblings.
 
+### Nix (flake)
+
+The repository carries a flake, so Nix users need no packaging step:
+
+```bash
+nix run github:grigio/carosello              # run straight from GitHub
+nix profile install github:grigio/carosello  # install
+```
+
+Or from a checkout: `nix build` / `nix run`. The package builds the flake's
+own source tree and reads the version from `Cargo.toml`, so a new release
+needs **no** flake edits; only `flake.lock` (the nixpkgs pin) is bumped
+automatically, weekly, by the `Update flake.lock` workflow — which builds
+the package before opening the PR. Every push also builds it via the `Nix`
+workflow.
+
 ### Cargo development build
 
 To compile without installing desktop integration:

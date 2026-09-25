@@ -11,3 +11,5 @@
 .cargo/
 cargo/vendored
 cargo-sources.json
+# nix build symlink
+/result
