@@ -26,7 +26,7 @@ source=(
   'cargo-lock.patch'
 )
 # Upstream tarballs change per release; update with `updpkgsums` after tagging.
-sha256sums=('e9b89f6b3e8f27dca6ce5e065cb813ff8b396238c970157142ef7ce9e4b84cbd'
+sha256sums=('3ea7df03e1c9c4755b9586ba77855aa420590600ed2235f63bdf4c7805846950'
             '3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986'
             '01ca5796700277d4e39d6a848bf55909f2a5a98e17817421f2102666dc416c45')
 
