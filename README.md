@@ -1,50 +1,33 @@
 # Carosello
 
-A fast, minimalist image and video viewer for Linux.
-
-Built with **Rust** and **GTK4/libadwaita** for native Wayland/X11 support.
+Fast, minimalist image and video viewer for Linux, written in Rust with GTK4/libadwaita.
 
 ![Carosello Screenshot](carosello.gif)
 
 ## Features
 
-- Opens images and videos from the command line, a file chooser, or drag and drop
-- Browses the current directory's supported media in natural filename order
-- Navigates with the keyboard, arrow keys, or trackpad gestures
-- Shows a slide transition between items when the next frame is ready
-- Decodes images on worker threads and prefetches neighboring images
-- Fits media to the window with aspect-ratio preservation
-- Zooms with the keyboard, `Ctrl` + mouse wheel, pinch, or double-click
-- Anchors double-click zoom at the pointer and lets you pan while zoomed
-- Applies EXIF orientation when displaying images
-- Rotates left/right and mirrors images horizontally
-- Plays videos with play/pause, seek, volume, mute, elapsed time, and duration controls
-- Starts videos muted, plays them automatically, and loops playback
-- Moves the current item to Trash, with direct deletion when no Trash is available
-- Offers persistent slide-animation and two-finger-swipe preferences
-- Auto-hides the header and video controls for distraction-free viewing
-- Shows in-app messages for load, save, Trash, and video errors
-- Supports fullscreen mode
+- Navigates with arrows or gestures, three-finger swipe (optional two-finger); slides when the prefetched frame is ready, cuts otherwise
+- Decodes on worker threads, prefetches neighbors, applies EXIF orientation, fits to window with aspect ratio kept
+- Zooms with keyboard, pinch, or double-click; double-click anchors at the pointer, drag pans while zoomed
+- Rotates left/right and mirrors in place from header buttons; JPEG re-encoded at q95 with EXIF normalized, no undo; animated GIF/WebP and video are view-only
+- Plays video muted, autoplaying, looped, with play/pause, seek, volume, mute, elapsed and total time
+- Deletes with `Delete`: Trash first, direct delete where Trash is unsupported (remote mounts, portal paths)
+- Auto-hides header and video controls, supports fullscreen.
 
-## Supported Formats
+## Supported formats
 
 | Type | Formats |
 |------|---------|
 | Images | JPEG (`.jpg`, `.jpeg`), PNG, WebP, GIF, BMP, TIFF (`.tif`, `.tiff`) |
 | Video | MP4, WebM, Matroska (`.mkv`) |
 
-Supported media is recognized case-insensitively by extension. Actual image
-decoding is based on the file contents, while video playback depends on the
-codecs provided by the installed GStreamer plugins.
+Extensions match case-insensitively. Image decoding reads file contents; video codecs come from installed GStreamer plugins.
 
 ## Installation
 
 ### Arch Linux (build from source)
 
-Carosello is not available through the AUR, so install it by building the
-upstream source locally. A per-user Meson install is recommended because it
-does not overwrite files managed by Pacman and does not require `sudo` for the
-install step.
+Not in the AUR. A per-user Meson install under `~/.local` avoids touching Pacman files and needs no `sudo` to install.
 
 Install the build and runtime dependencies:
 
@@ -79,8 +62,7 @@ application menu or run:
 carosello
 ```
 
-The Meson install places the binary, desktop entry, AppStream metadata, and
-icon under `~/.local`. To rebuild after pulling new changes, run:
+This installs binary, desktop entry, AppStream metadata, and icon under `~/.local`. After pulling changes, rerun:
 
 ```bash
 meson compile -C builddir
@@ -97,12 +79,11 @@ flatpak install --user ./carosello.flatpak
 flatpak run io.github.grigio.carosello
 ```
 
-The release artifact produced by CI is currently for x86_64.
+CI artifacts are x86_64 only.
 
 ### Flatpak from this source tree
 
-The manifest targets the GNOME 50 runtime and its freedesktop 25.08 Rust
-extension:
+Needs GNOME 50 runtime plus freedesktop 25.08 Rust extension:
 
 ```bash
 sudo pacman -S --needed flatpak flatpak-builder
@@ -111,35 +92,26 @@ flatpak install --user flathub \
   org.freedesktop.Sdk.Extension.rust-stable//25.08
 ```
 
-The manifest also expects the ignored `cargo-sources.json` file. Generate it
-from `Cargo.lock` using the `Generate Cargo sources for Flatpak` command in
-[`.github/workflows/ci.yml`](.github/workflows/ci.yml), then build and install:
+Also generate the ignored `cargo-sources.json` from `Cargo.lock` with the `Generate Cargo sources for Flatpak` command in
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml), then:
 
 ```bash
 flatpak-builder --user --install --force-clean \
   build-dir io.github.grigio.carosello.yml
 ```
 
-The Flatpak has read/write host and GVfs access so it can browse remote
-folders, edit images in place, and use Trash where supported. A single file
-opened through the document portal contains only that file; use **Open Folder…**
-to export a directory and browse its siblings.
+The Flatpak has host and GVfs read/write access for remote folders, in-place edits, and Trash. A single file picked through the document portal exposes only that file; use Open Folder… to browse siblings.
 
 ### Nix (flake)
 
-The repository carries a flake, so Nix users need no packaging step:
+No packaging step, version comes from `Cargo.toml`:
 
 ```bash
 nix run github:grigio/carosello              # run straight from GitHub
 nix profile install github:grigio/carosello  # install
 ```
 
-Or from a checkout: `nix build` / `nix run`. The package builds the flake's
-own source tree and reads the version from `Cargo.toml`, so a new release
-needs **no** flake edits; only `flake.lock` (the nixpkgs pin) is bumped
-automatically, weekly, by the `Update flake.lock` workflow — which builds
-the package before opening the PR. Every push also builds it via the `Nix`
-workflow.
+From a checkout: `nix build` / `nix run`. Only `flake.lock` moves, via a weekly workflow that builds before opening the PR; every push also builds through the `Nix` workflow.
 
 ### Cargo development build
 
@@ -163,45 +135,19 @@ carosello /path/to/directory
 carosello /path/to/image.jpg
 ```
 
-Directory listings are shallow rather than recursive and include supported
-media files only. Filenames are naturally sorted, so names such as `IMG2.jpg`
-come before `IMG10.jpg`. Carosello uses one positional path; launching it
-again while a window is open presents the existing window.
+Takes one positional path; a second launch presents the existing window. Open… (`Ctrl+O`) picks a file, Open Folder… (`Ctrl+Shift+O`) picks a directory. Under the Flatpak portal, Open Folder… is the way to get siblings and a writable export.
 
-Use **Open…** (`Ctrl+O`) to choose a file or **Open Folder…** (`Ctrl+Shift+O`)
-to choose a directory. With the Flatpak document portal, choosing a folder is
-also the reliable way to browse siblings and obtain a writable export.
+## Image editing
 
-## Image Editing
-
-The header buttons rotate the current image left or right and mirror it
-horizontally. Each operation is saved in place over the original file, and the
-view refreshes after saving. JPEG EXIF orientation is normalized to prevent a
-reload from rotating the image a second time.
-
-Image edits are destructive and there is currently no undo button. JPEG files
-are re-encoded at quality 95, so their bytes can change even when an operation
-is later reversed. Animated GIF and WebP files can be viewed but are rejected
-by the editing tools; video files cannot be transformed.
+Header buttons rotate left/right and mirror. Each edit overwrites the original and refreshes the view, with JPEG orientation normalized so reloads do not rotate twice. Edits are destructive with no undo, and JPEG bytes change even for a reversed operation.
 
 ## Preferences
 
-Open **Preferences…** from the application menu to configure:
+In the app menu. Slide animation defaults on (falls back to an instant cut if the frame is not prefetched); two-finger swipe defaults off (replaces three-finger nav when on). Stored in `settings.conf` under `~/.config/carosello`.
 
-- **Slide animation** — enabled by default. If a prefetched frame is not ready,
-  Carosello switches immediately rather than delaying navigation.
-- **Two-finger swipe** — disabled by default. When enabled, two-finger gestures
-  navigate instead of the default three-finger gestures.
+## File association
 
-Both settings persist in `settings.conf` under the user's configuration
-directory (`~/.config/carosello` by default).
-
-## File Association
-
-After installation, Carosello's desktop entry registers it for JPEG, PNG,
-WebP, GIF, BMP, TIFF, MP4, WebM, and Matroska MIME types. The canonical types
-are mirrored in the AppStream `<provides>` block; the desktop entry also
-registers legacy BMP and TIFF aliases.
+The desktop entry registers JPEG, PNG, WebP, GIF, BMP, TIFF, MP4, WebM, and Matroska types, mirrored in AppStream `<provides>` plus legacy BMP/TIFF aliases.
 
 To make it the default for all supported types:
 
@@ -218,7 +164,7 @@ Or set one type through GIO:
 gio mime image/jpeg io.github.grigio.carosello.desktop
 ```
 
-## Keyboard Shortcuts
+## Keyboard shortcuts
 
 ### Navigation
 
@@ -228,7 +174,7 @@ gio mime image/jpeg io.github.grigio.carosello.desktop
 | `Page Up` / `Page Down` | Previous / next file |
 | `Home` / `End` | First / last file |
 
-### Zoom and View
+### Zoom and view
 
 | Key | Action |
 |-----|--------|
@@ -239,7 +185,7 @@ gio mime image/jpeg io.github.grigio.carosello.desktop
 | `Double-click` | Toggle between fit and 2.5× zoom at the pointer |
 | `F11` / `F` | Toggle fullscreen |
 
-### Application and Files
+### Application and files
 
 | Key | Action |
 |-----|--------|
@@ -251,7 +197,7 @@ gio mime image/jpeg io.github.grigio.carosello.desktop
 | `Ctrl+W` | Close the window |
 | `Ctrl+Q` | Quit |
 
-### Video Controls
+### Video controls
 
 | Key | Action |
 |-----|--------|
@@ -274,26 +220,15 @@ gio mime image/jpeg io.github.grigio.carosello.desktop
 | Double-click | Toggle fit and pointer-anchored 2.5× zoom |
 | Drag and drop | Open dropped files or directories |
 
-When **Two-finger swipe** is enabled in Preferences, two-finger gestures
-replace the default three-finger gestures.
+With Two-finger swipe on, two-finger gestures replace three-finger ones.
 
-## Design Principles
+## Design principles
 
-- **Fast** — Decode images off the UI thread and prefetch nearby frames; an
-  unavailable frame causes an immediate switch rather than blocking the UI
-- **Minimal** — No built-in file browser, thumbnail grid, or metadata viewer;
-  use the system file chooser when needed
-- **Keyboard-first** — Navigate with the keyboard and zoom with `Ctrl` + scroll,
-  pinch, or keyboard shortcuts
+Fast (decode off the UI thread, prefetch neighbors, never block on a missing frame), minimal (no browser, thumbnails, or metadata viewer), keyboard-first (`Ctrl` + scroll, pinch, shortcuts for zoom).
 
-## Tech Stack
+## Tech stack
 
-- **Language:** Rust
-- **UI Toolkit:** GTK4 + libadwaita
-- **Image Decoding:** Rust `image` crate on worker threads
-- **Display Texture:** GDK `MemoryTexture`
-- **Video Playback:** GTK `MediaFile` backed by GStreamer
-- **EXIF Parsing:** kamadak-exif
+Rust, GTK4 + libadwaita, `image` crate on worker threads, GDK `MemoryTexture`, GTK `MediaFile` with GStreamer, kamadak-exif.
 
 ## License
 
@@ -301,7 +236,5 @@ GPL-3.0-or-later
 
 ## Donations
 
-If you find this project helpful, please consider making a donation to support its development.
-
-- **Monero**: `88LyqYXn4LdCVDtPWKuton9hJwbo8ZduNEGuARHGdeSJ79BBYWGpMQR8VGWxGDKtTLLM6E9MJm8RvW9VMUgCcSXu19L9FSv`
-- **Bitcoin**: `bc1q6mh77hfv8x8pa0clzskw6ndysujmr78j6se025`
+- Monero: `88LyqYXn4LdCVDtPWKuton9hJwbo8ZduNEGuARHGdeSJ79BBYWGpMQR8VGWxGDKtTLLM6E9MJm8RvW9VMUgCcSXu19L9FSv`
+- Bitcoin: `bc1q6mh77hfv8x8pa0clzskw6ndysujmr78j6se025`
