@@ -8,8 +8,10 @@ mod zoom;
 use std::path::PathBuf;
 
 use gtk::prelude::*;
-use gtk::{self, glib};
+use gtk::{self, gio, glib};
 use libadwaita as adw;
+
+use crate::state::debug_log;
 
 const APP_ID: &str = "io.github.grigio.carosello";
 
@@ -56,14 +58,51 @@ fn main() -> glib::ExitCode {
     });
 
     app.connect_command_line(|app, cmd_line| {
-        // Single-instance: a second launch presents the existing window
-        // instead of opening a duplicate.
+        let args = cmd_line.arguments();
+        let cwd = cmd_line.cwd();
+        // A file manager expands `Exec=carosello %U` to a plain path when
+        // FUSE maps it and to a `file://` URI otherwise, so the argument is
+        // resolved with `File::for_commandline_arg` — the conversion GLib
+        // itself uses for HANDLES_OPEN. `PathBuf::from(arg)` would keep the
+        // `file://` prefix and open an empty window instead.
+        let start: Option<PathBuf> = args
+            .iter()
+            .skip(1)
+            .find(|a| !a.to_string_lossy().starts_with('-'))
+            .and_then(|a| {
+                let file = match &cwd {
+                    Some(cwd) => gio::File::for_commandline_arg_and_cwd(a, cwd),
+                    None => gio::File::for_commandline_arg(a),
+                };
+                file.path()
+            });
+        debug_log!(format!(
+            "command-line: {} arg(s) -> {}",
+            args.len().saturating_sub(1),
+            start
+                .as_ref()
+                .map_or_else(|| "none".into(), |p| p.display().to_string())
+        ));
+
+        // Single-instance: re-activation raises the existing window, and a
+        // path handed to us (file manager double-click, `gio open`) *replaces*
+        // what it shows instead of leaving the current item up.
         if let Some(win) = app.active_window() {
+            if let Some(path) = &start {
+                // URI, not path: percent-encoding keeps non-UTF-8 names
+                // lossless inside the `s` action parameter. The `win.` prefix
+                // is how GtkApplicationWindow publishes its own action group
+                // into the widget muxer (`gtk_application_window_init`).
+                let uri = gio::File::for_path(path).uri();
+                if let Err(err) =
+                    win.activate_action("win.open-path", Some(&glib::Variant::from(uri.as_str())))
+                {
+                    debug_log!(format!("command-line: open-path failed: {err}"));
+                }
+            }
             win.present();
             return glib::ExitCode::SUCCESS.into();
         }
-        let args = cmd_line.arguments();
-        let start = args.get(1).map(PathBuf::from);
         let window = window::build(app, start.as_deref());
         window.present();
         glib::ExitCode::SUCCESS.into()

@@ -1211,28 +1211,12 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
                         if files.is_empty() {
                             files = vec![path.clone()];
                             if !is_media(&path) {
-                                if let Some(ref ov) = state.borrow().toast_overlay {
-                                    let toast = adw::Toast::new("Unsupported file type");
-                                    ov.add_toast(toast);
-                                }
+                                show_toast(&state, "Unsupported file type");
                                 return;
                             }
                         }
                         let start_index = files.iter().position(|f| f == &path).unwrap_or(0);
-                        cancel_slide(&state);
-                        {
-                            let mut s = state.borrow_mut();
-                            s.files = files;
-                            s.index = start_index;
-                            s.zoom = 1.0;
-                        }
-                        scrolled.hadjustment().set_value(0.0);
-                        scrolled.vadjustment().set_value(0.0);
-                        if let Some(ref st) = state.borrow().empty_status.clone() {
-                            st.set_visible(false);
-                        }
-                        scrolled.set_visible(true);
-                        show_file(&state, &picture, &scrolled, &window);
+                        load_scope(&state, &picture, &scrolled, &window, files, start_index);
                     }
                 }
             });
@@ -1266,25 +1250,66 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
                             show_toast(&state, "No images or videos in this folder");
                             return;
                         }
-                        cancel_slide(&state);
-                        {
-                            let mut s = state.borrow_mut();
-                            s.files = files;
-                            s.index = 0;
-                            s.zoom = 1.0;
-                        }
-                        reset_scroll(&scrolled);
-                        if let Some(ref st) = state.borrow().empty_status.clone() {
-                            st.set_visible(false);
-                        }
-                        scrolled.set_visible(true);
-                        show_file(&state, &picture, &scrolled, &window);
+                        load_scope(&state, &picture, &scrolled, &window, files, 0);
                     }
                 }
             });
         });
     }
     window.add_action(&open_folder_action);
+
+    // ── Open a path handed over by another launch ──
+    // A second `carosello <file>` (file manager double-click, `gio open`)
+    // forwards its argument to *this* instance over D-Bus; main.rs resolves
+    // it to a `file://` URI and activates this action, so the clicked item
+    // replaces what is on screen instead of the window merely being raised.
+    let open_path_action = gio::SimpleAction::new("open-path", Some(glib::VariantTy::STRING));
+    {
+        let state = state.clone();
+        let picture = picture.clone();
+        let scrolled = scrolled.clone();
+        let window = window.clone();
+        open_path_action.connect_activate(move |_, param| {
+            let Some(uri) = param.and_then(|v| v.str()) else {
+                return;
+            };
+            let Some(path) = gio::File::for_uri(uri).path() else {
+                // No POSIX path: smb://, sftp:// without a FUSE mount, …
+                debug_log!(format!("open-path: no local path for {uri}"));
+                show_toast(&state, "Unsupported location");
+                return;
+            };
+            debug_log!(format!("open-path: {} (uri={uri})", path.display()));
+            if path.is_dir() {
+                // A folder argument defines its own scope (same rule as a
+                // dropped folder): list it and start at its first item.
+                let files = state::collect_media(&path);
+                if files.is_empty() {
+                    show_toast(&state, "No images or videos in this folder");
+                    return;
+                }
+                load_scope(&state, &picture, &scrolled, &window, files, 0);
+                return;
+            }
+            // A file scopes its whole parent folder, so ← / → still browse
+            // its siblings — the same rule as Open… and a local file drop.
+            let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+            let mut files = state::collect_media(&dir);
+            if !files.iter().any(|f| f == &path) {
+                if !is_media(&path) {
+                    show_toast(&state, "Unsupported file type");
+                    return;
+                }
+                // Not in the listing and still a media file: the directory
+                // couldn't be read (portal export, permissions) — keep just
+                // this one file, like Open… does for a single portal file.
+                files = vec![path.clone()];
+            }
+            let index = files.iter().position(|f| f == &path).unwrap_or(0);
+            load_scope(&state, &picture, &scrolled, &window, files, index);
+        });
+    }
+    window.add_action(&open_path_action);
 
     // Shortcuts dialog — HIG §Keyboard
     let shortcuts_action = gio::SimpleAction::new("shortcuts", None);
@@ -2255,6 +2280,33 @@ fn collect_media_gio(parent: &gio::File) -> Vec<PathBuf> {
 fn reset_scroll(scrolled: &gtk::ScrolledWindow) {
     scrolled.hadjustment().set_value(0.0);
     scrolled.vadjustment().set_value(0.0);
+}
+
+/// Install a new folder scope (`files` shown at `index`) and display it.
+/// The tail shared by Open…, Open Folder… and `open-path`: everything that
+/// rebuilds the list from a *chosen* path ends here, so the slide cancel,
+/// zoom/scroll reset and empty-state handling can't drift apart.
+fn load_scope(
+    state: &Rc<RefCell<AppState>>,
+    picture: &gtk::Picture,
+    scrolled: &gtk::ScrolledWindow,
+    window: &adw::ApplicationWindow,
+    files: Vec<PathBuf>,
+    index: usize,
+) {
+    cancel_slide(state);
+    {
+        let mut s = state.borrow_mut();
+        s.files = files;
+        s.index = index;
+        s.zoom = 1.0;
+    }
+    reset_scroll(scrolled);
+    if let Some(ref st) = state.borrow().empty_status.clone() {
+        st.set_visible(false);
+    }
+    scrolled.set_visible(true);
+    show_file(state, picture, scrolled, window);
 }
 
 // ── Auto-hide helpers (CSS opacity only: `.fade-controls` / `.faded`,
