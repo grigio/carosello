@@ -16,6 +16,19 @@ use crate::state::{self, debug_log, format_time, is_media};
 use crate::transform;
 use crate::zoom::{self, ZoomPaintable};
 
+/// Fallback window size: the empty state, and the size the builder starts
+/// from before the first item's own size is known (also what the deferred
+/// video fit compares against to tell "untouched" from "user resized").
+const DEFAULT_WINDOW_W: i32 = 900;
+const DEFAULT_WINDOW_H: i32 = 600;
+/// The initial fit keeps this much screen edge free on every side, so a
+/// huge first item maps as a big *window*, not a screen-filling one.
+const FIT_EDGE_MARGIN: i32 = 48;
+/// …and never opens below this, whatever the first item is (a 100 px tall
+/// panorama would otherwise map to a 100 px tall window).
+const FIT_MIN_W: i32 = 480;
+const FIT_MIN_H: i32 = 360;
+
 struct AppState {
     files: Vec<PathBuf>,
     index: usize,
@@ -96,6 +109,12 @@ struct AppState {
     /// fit_h, zoom)`; skip re-setting identical `content_fit` /
     /// `size_request` / view values (report: lower-impact polish).
     last_layout: Option<(i32, i32, bool, f64, f64, f64)>,
+    /// Pending *initial fit*: `(index it is owed to, default size the
+    /// window was created with)`. Set once in `build`, consumed by the
+    /// first `fit_window_to_media` call (or by showing a different item),
+    /// so exactly one item — the first shown — may size the window. See
+    /// `fit_window_to_media`.
+    startup_fit: Option<(usize, (i32, i32))>,
 }
 
 /// One interactive swipe drag: the outgoing frame plus the incoming
@@ -236,6 +255,7 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
         trashing: false,
         last_seek_ui: None,
         last_layout: None,
+        startup_fit: None,
     }));
 
     let mut start_index: usize = 0;
@@ -256,10 +276,45 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("Carosello")
-        .default_width(900)
-        .default_height(600)
+        .default_width(DEFAULT_WINDOW_W)
+        .default_height(DEFAULT_WINDOW_H)
         .css_classes(["carosello-window"])
         .build();
+
+    // ── Initial fit: open at the first item's own size ──
+    // Images are probed from their headers *before* the window maps, so
+    // it appears at the right size from the first frame; a video's size
+    // only exists once its pipeline prepares, so that fit is deferred to
+    // `show_video` (still one-shot — see `fit_window_to_media`).
+    state.borrow_mut().startup_fit = Some((start_index, window.default_size()));
+    // Probe in its own statement: the `Ref` must drop before
+    // `fit_window_to_media` takes the fit (`if let Some(…) =
+    // state.borrow()…` keeps it alive for the whole block — AGENTS.md).
+    let first_fit = state
+        .borrow()
+        .files
+        .get(start_index)
+        .and_then(|p| state::probe_dimensions(p));
+    if let Some((w, h)) = first_fit {
+        fit_window_to_media(&window, &state, start_index, w, h);
+    }
+    // GTK writes the size it actually mapped at back into the default size
+    // (output bounds, CSD shadow, a smaller monitor than the biggest one).
+    // Refresh the guard *after* `present()`, so the deferred video fit
+    // compares against that, not against the pre-map request.
+    if state.borrow().startup_fit.is_some() {
+        let state_c = state.clone();
+        let weak_win = window.downgrade();
+        glib::idle_add_local_once(move || {
+            let Some(win) = weak_win.upgrade() else {
+                return;
+            };
+            let mut s = state_c.borrow_mut();
+            if let Some(fit) = s.startup_fit.as_mut() {
+                fit.1 = win.default_size();
+            }
+        });
+    }
 
     let overlay = gtk::Overlay::new();
 
@@ -3977,6 +4032,91 @@ fn finish_transform(
     );
 }
 
+/// Largest monitor attached to the default display, `(w, h)` in logical
+/// pixels. Taken across monitors because the compositor picks the one the
+/// window opens on; GTK also clamps the map to the *actual* output bounds
+/// — this only reserves [`FIT_EDGE_MARGIN`] so a huge item maps as a big
+/// window instead of a screen-filling one.
+fn max_monitor_bounds() -> Option<(i32, i32)> {
+    let display = gdk::Display::default()?;
+    let monitors = display.monitors();
+    let mut bounds = (0, 0);
+    for i in 0..monitors.n_items() {
+        let Some(monitor) = monitors
+            .item(i)
+            .and_then(|obj| obj.downcast::<gdk::Monitor>().ok())
+        else {
+            continue;
+        };
+        let geo = monitor.geometry();
+        bounds.0 = bounds.0.max(geo.width());
+        bounds.1 = bounds.1.max(geo.height());
+    }
+    (bounds.0 > 0 && bounds.1 > 0).then_some(bounds)
+}
+
+/// Media size → window *content* size (GTK's "default size": the CSD
+/// shadow is added on top of that by GTK itself).
+///
+/// Keeps the aspect, never grows the item past `bounds` minus
+/// [`FIT_EDGE_MARGIN`] and never shrinks it below [`FIT_MIN_W`] ×
+/// [`FIT_MIN_H`]. `bounds: None` (no display info) only floors — GTK
+/// clamps the actual map to the real output anyway.
+fn fit_content(iw: i32, ih: i32, bounds: Option<(i32, i32)>) -> (i32, i32) {
+    if iw <= 0 || ih <= 0 {
+        return (DEFAULT_WINDOW_W, DEFAULT_WINDOW_H);
+    }
+    let (mut w, mut h) = (iw, ih);
+    if let Some((bw, bh)) = bounds {
+        let max_w = (bw - 2 * FIT_EDGE_MARGIN).max(FIT_MIN_W);
+        let max_h = (bh - 2 * FIT_EDGE_MARGIN).max(FIT_MIN_H);
+        let scale = (f64::from(max_w) / f64::from(w))
+            .min(f64::from(max_h) / f64::from(h))
+            .min(1.0);
+        if scale < 1.0 {
+            w = (f64::from(w) * scale).round() as i32;
+            h = (f64::from(h) * scale).round() as i32;
+        }
+    }
+    (w.max(FIT_MIN_W), h.max(FIT_MIN_H))
+}
+
+/// Size the window to the item at `idx` — the only place after `build`
+/// that changes it, and the *one-shot* fit for the first item shown.
+///
+/// It needs `startup_fit` to still be pending for exactly this index and
+/// to still hold the size GTK is using: showing another item clears it
+/// (see `show_file`), and a resize/maximize/fullscreen in the meantime
+/// means the user got there first. That is what makes the deferred
+/// **video** fit safe to apply once the window is already on screen — a
+/// video's intrinsic size only exists after the pipeline prepares, i.e.
+/// after `present()`.
+fn fit_window_to_media(
+    window: &adw::ApplicationWindow,
+    state: &Rc<RefCell<AppState>>,
+    idx: usize,
+    w: i32,
+    h: i32,
+) {
+    // Two statements: the `RefMut` temporary must drop before anything
+    // else touches `state` — the `if let Some(x) = …borrow_mut()` shape
+    // keeps that borrow alive for the whole `if` (AGENTS.md / RefCell).
+    let pending = state.borrow_mut().startup_fit.take();
+    let Some((fit_idx, startup)) = pending else {
+        return; // already fitted (or nothing was ever owed)
+    };
+    if fit_idx != idx {
+        return; // a later item: browsing never resizes the window
+    }
+    if startup != window.default_size() || window.is_maximized() || window.is_fullscreen() {
+        debug_log!("initial fit: skipped, window already resized by the user");
+        return;
+    }
+    let (cw, ch) = fit_content(w, h, max_monitor_bounds());
+    debug_log!(format!("initial fit: item {w}x{h} -> window {cw}x{ch}"));
+    window.set_default_size(cw, ch);
+}
+
 fn show_file(
     state: &Rc<RefCell<AppState>>,
     picture: &gtk::Picture,
@@ -4011,6 +4151,19 @@ fn show_file(
         (s.files[s.index].clone(), s.index, s.files.len())
     };
 
+    // Only the first item ever shown may size the window: any other index
+    // means browsing has started, and for that first item this covers the
+    // ways `build` can't pre-fit (Open…/drop on an already-mapped window).
+    // Images probe their headers here — header bytes only, no decode —
+    // while a video keeps the fit pending until `show_video` learns the
+    // intrinsic size.
+    let first_pending = matches!(state.borrow().startup_fit, Some((i, _)) if i == idx);
+    if !first_pending {
+        state.borrow_mut().startup_fit = None;
+    } else if let Some((w, h)) = state::probe_dimensions(&path) {
+        fit_window_to_media(window, state, idx, w, h);
+    }
+
     // Ensure content visible, empty hidden
     if let Some(ref st) = state.borrow().empty_status.clone() {
         st.set_visible(false);
@@ -4039,7 +4192,7 @@ fn show_file(
     }
 
     if state::has_ext(&path, state::VIDEO_EXTS) {
-        show_video(state, picture, scrolled, &path);
+        show_video(state, picture, scrolled, window, &path);
     } else {
         show_image(state, picture, scrolled, &path);
     }
@@ -4561,6 +4714,7 @@ fn show_video(
     state: &Rc<RefCell<AppState>>,
     picture: &gtk::Picture,
     scrolled: &gtk::ScrolledWindow,
+    window: &adw::ApplicationWindow,
     path: &Path,
 ) {
     // Pause outside the borrow: pause() synchronously emits playing
@@ -4661,6 +4815,7 @@ fn show_video(
         let weak_pic = picture.downgrade();
         let weak_scrolled = scrolled.downgrade();
         let weak_media = media.downgrade();
+        let weak_win = window.downgrade();
         let size_handler = Rc::new(RefCell::new(None::<glib::SignalHandlerId>));
         let size_handler_c = size_handler.clone();
         let id = media.connect_invalidate_size(move |_| {
@@ -4686,6 +4841,16 @@ fn show_video(
                 };
                 if changed {
                     debug_log!(format!("video: size discovered {wi}x{hi}"));
+                    // A video is the one first item whose size can't be
+                    // probed before `present()`: the initial fit lands
+                    // here instead, as soon as the pipeline reports the
+                    // intrinsic size. One-shot and loser-to-the-user —
+                    // `fit_window_to_media` spends `startup_fit` and
+                    // checks nobody resized in the meantime.
+                    if let Some(win) = weak_win.upgrade() {
+                        let idx = state_c.borrow().index;
+                        fit_window_to_media(&win, &state_c, idx, wi, hi);
+                    }
                     schedule_update(&state_c, &picture_c, &scrolled_c);
                     // Size known: stop listening (one-shot).
                     if let Some(hid) = size_handler_c.borrow_mut().take() {
@@ -4783,5 +4948,48 @@ mod tests {
         let missing = std::env::temp_dir().join("carosello-gio-nonexistent-xyz");
         let _ = std::fs::remove_dir_all(&missing);
         assert!(collect_media_gio(&gio::File::for_path(&missing)).is_empty());
+    }
+
+    #[test]
+    fn test_fit_content_leaves_an_item_that_already_fits_alone() {
+        assert_eq!(fit_content(1024, 768, Some((1560, 1040))), (1024, 768));
+    }
+
+    #[test]
+    fn test_fit_content_scales_a_huge_item_into_the_margin() {
+        // 4000×3000 on a 1560×1040 screen: height binds, aspect survives
+        // rounding, and the window stays clear of the screen edges.
+        let (w, h) = fit_content(4000, 3000, Some((1560, 1040)));
+        assert_eq!(h, 1040 - 2 * FIT_EDGE_MARGIN);
+        assert!(
+            (f64::from(w) / f64::from(h) - 4.0 / 3.0).abs() < 0.01,
+            "aspect drifted: {w}x{h}"
+        );
+        assert!(w <= 1560 - 2 * FIT_EDGE_MARGIN);
+    }
+
+    #[test]
+    fn test_fit_content_floors_tiny_and_flat_items() {
+        // A tiny item still opens a usable window…
+        assert_eq!(
+            fit_content(64, 64, Some((1560, 1040))),
+            (FIT_MIN_W, FIT_MIN_H)
+        );
+        // …and a panorama gets a floor on height instead of mapping 73 px
+        // tall (width still obeys the bounds margin).
+        assert_eq!(
+            fit_content(4000, 200, Some((1560, 1040))),
+            (1560 - 2 * FIT_EDGE_MARGIN, FIT_MIN_H)
+        );
+    }
+
+    #[test]
+    fn test_fit_content_without_bounds_and_on_garbage() {
+        // No display info: only the floor applies, GTK clamps the map.
+        assert_eq!(fit_content(4000, 3000, None), (4000, 3000));
+        assert_eq!(
+            fit_content(0, -5, None),
+            (DEFAULT_WINDOW_W, DEFAULT_WINDOW_H)
+        );
     }
 }

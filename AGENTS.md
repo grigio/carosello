@@ -239,6 +239,46 @@
   the stale `prefetch` entry, re-enable buttons, re-run `show_image()`
   only if the path is still the current index.
 
+## Initial window fit (first item sizes the window)
+
+- `AppState.startup_fit: Option<(usize, (i32, i32))>` = *(index the fit is
+  owed to, default size the window was created with)* — set once in
+  `build`, spent by `fit_window_to_media`, cleared by `show_file` as soon
+  as a **different** index is shown. Consequences worth preserving:
+  exactly one item (the first ever shown) may size the window, browsing
+  never resizes, and the fit loses to the user (`startup != default_size()`
+  ⇒ GTK already wrote a resize back into `default_size`, or
+  `is_maximized`/`is_fullscreen`).
+- **Images are probed before `present()`**: `state::probe_dimensions` =
+  `image::ImageReader::into_dimensions()` (header bytes only, no decode) +
+  EXIF orientation via `media::read_exif_orientation` (reader twin of
+  `…_bytes`), swapping axes for orientations 5..=8 — a phone portrait is
+  *stored landscape* + Orientation 6, so skipping the swap opens a
+  landscape window. Because it runs unmapped, there is no 900×600 flash.
+- **Videos are fitted later, from `show_video`'s `invalidate_size`
+  handler** (no GStreamer/`MediaFile` intrinsic size exists before the
+  pipeline prepares, i.e. after map). Verified on this machine: the fit
+  can still land before the first allocation, so it often maps straight at
+  the final size; when it doesn't, the window resizes once — accepted, and
+  exactly why the guard exists.
+- `fit_content(iw, ih, bounds)` is pure (unit-tested): keep aspect,
+  clamp inside `max_monitor_bounds()` − `FIT_EDGE_MARGIN` (48 px per
+  side, GTK adds the CSD shadow itself), floor at `FIT_MIN_W/H`
+  (480×360). `bounds: None` only floors; GTK clamps the real map.
+- The RefCell trap here is the `if let Some(…) = state.borrow()…`
+  scrutinee: the `Ref` lives for the whole block, so the `fit` inside the
+  body panics. Probe into a `let` **before** the `if` (see the comment in
+  `build`).
+- **Verify with `CAROSELLO_DEBUG=1`**: `probe: … -> WxH (orientation N)` +
+  `initial fit: item WxH -> window CwxCh`. Ground truth for what GTK
+  actually mapped: a temporary `timeout_add_local` printing
+  `win.width()/height()` (widget allocation = content size) — measurements
+  were exact for all four cases (1200×800, 1416×944, 531×944, 480×360) and
+  900×600 on an empty folder; `grim` + a baseline screenshot diff
+  (`cols/rows > 400` runs) confirms the on-screen rectangle, but it
+  fragments where window content resembles the wallpaper (threshold
+  artifacts, not size bugs) and gets truncated by panels.
+
 ## Zoom anchor
 
 - `GestureClick::pressed` x/y are **per-device** on Wayland while the pointer

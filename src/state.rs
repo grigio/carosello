@@ -347,6 +347,52 @@ pub fn collect_media(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
+/// Display size of `path` in pixels, read from **headers only** (no pixel
+/// decode) — cheap enough to run synchronously while the window is still
+/// unmapped, which is what lets the initial window fit the first item
+/// with no visible 900×600 → real-size jump (see
+/// `window::fit_window_to_media`).
+///
+/// EXIF Orientation is applied the way the display decode applies it, so
+/// a phone portrait (stored landscape + Orientation 6) probes as
+/// portrait. Videos return `None`: their intrinsic size only exists once
+/// the media pipeline prepares, so they take the deferred fit instead.
+pub fn probe_dimensions(path: &Path) -> Option<(i32, i32)> {
+    if !has_ext(path, IMAGE_EXTS) {
+        return None;
+    }
+    let file = std::fs::File::open(path).ok()?;
+    let mut source = std::io::BufReader::new(file);
+    let reader = image::ImageReader::new(&mut source)
+        .with_guessed_format()
+        .ok()?;
+    // Header parse: SOF/IHDR/… for the size, nothing else is read.
+    let (w, h) = reader.into_dimensions().ok()?;
+    // `reader` was consumed, so the `&mut source` borrow is over: rewind
+    // past the sniffed prefix before walking the APP1 segments.
+    std::io::Seek::rewind(&mut source).ok()?;
+    let orientation = crate::media::read_exif_orientation(&mut source);
+    let (w, h) = display_dims(w, h, orientation);
+    debug_log!(format!(
+        "probe: {} -> {w}x{h} (orientation {orientation})",
+        path.display()
+    ));
+    Some((w, h))
+}
+
+/// Stored size × EXIF Orientation → display size: orientations 5..=8
+/// transpose, the rest keep the axes. Saturates instead of overflowing on
+/// absurd headers — the caller clamps to the screen anyway.
+fn display_dims(w: u32, h: u32, orientation: u8) -> (i32, i32) {
+    let (w, h) = if (5..=8).contains(&orientation) {
+        (h, w)
+    } else {
+        (w, h)
+    };
+    let clamp = |v: u32| i32::try_from(v).unwrap_or(i32::MAX);
+    (clamp(w), clamp(h))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -589,5 +635,36 @@ mod tests {
         assert_eq!(fling_velocity(&[(0, 0.0), (100_000, -200.0)]), -2.0);
         // Sub-millisecond spans yield zero instead of exploding.
         assert_eq!(fling_velocity(&[(0, 0.0), (500, -200.0)]), 0.0);
+    }
+
+    #[test]
+    fn test_display_dims_transposes_only_rotated_orientations() {
+        // 5..=8 are the transposing orientations (a phone portrait is
+        // stored landscape + Orientation 6), everything else is axis-safe.
+        assert_eq!(display_dims(4032, 3024, 1), (4032, 3024));
+        assert_eq!(display_dims(4032, 3024, 3), (4032, 3024));
+        assert_eq!(display_dims(4032, 3024, 6), (3024, 4032));
+        assert_eq!(display_dims(4032, 3024, 8), (3024, 4032));
+        // Out-of-range junk reads as orientation 1 upstream, and a
+        // degenerate header must saturate rather than wrap.
+        assert_eq!(display_dims(4032, 3024, 0), (4032, 3024));
+        assert_eq!(display_dims(u32::MAX, u32::MAX, 6), (i32::MAX, i32::MAX));
+    }
+
+    #[test]
+    fn test_probe_dimensions_reads_image_header() {
+        let dir = std::env::temp_dir().join(format!("carosello-probe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = dir.join("probe.png");
+        image::DynamicImage::new_rgb8(7, 5)
+            .save(&png)
+            .expect("write png");
+        assert_eq!(probe_dimensions(&png), Some((7, 5)));
+        // Videos and anything unreadable probe as "unknown": the window
+        // then keeps its default size (a video takes the deferred fit).
+        assert_eq!(probe_dimensions(&dir.join("clip.mp4")), None);
+        assert_eq!(probe_dimensions(&dir.join("missing.jpg")), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -17,6 +17,14 @@ pub fn read_exif_orientation_bytes(bytes: &[u8]) -> u8 {
     orientation_from_reader(&mut std::io::BufReader::new(std::io::Cursor::new(bytes)))
 }
 
+/// Read the EXIF Orientation tag from a seekable stream — the twin of
+/// [`read_exif_orientation_bytes`] for callers that already have a file
+/// open (the startup dimension probe): same parser, no need to buffer the
+/// whole file just to learn the orientation.
+pub fn read_exif_orientation<R: std::io::BufRead + std::io::Seek>(reader: &mut R) -> u8 {
+    orientation_from_reader(reader)
+}
+
 fn orientation_from_reader<R: std::io::BufRead + std::io::Seek>(reader: &mut R) -> u8 {
     let Ok(exif) = exif::Reader::new().read_from_container(reader) else {
         return 1;

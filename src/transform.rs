@@ -704,4 +704,28 @@ mod tests {
         }
         panic!("orientation tag missing");
     }
+
+    /// The startup window fit reads sizes through `state::probe_dimensions`,
+    /// which must transpose exactly like the display decode: this 2×1 JPEG
+    /// tagged Orientation 6 (rotate 90° CW to display) has to probe as 1×2,
+    /// or a phone portrait would open a landscape window. Round-tripped
+    /// through a real file, since that is how the probe is used.
+    #[test]
+    fn test_probe_dimensions_applies_exif_orientation() {
+        let img = DynamicImage::ImageRgba8(two_pixels());
+        let src = jpeg_with_exif(&encode_test_jpeg(&img), 6);
+        let dir = std::env::temp_dir().join(format!("carosello-probe-exif-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("portrait.jpg");
+        std::fs::write(&path, &src).expect("write jpeg");
+        assert_eq!(crate::state::probe_dimensions(&path), Some((1, 2)));
+        // Same file without the transposing tag keeps its stored axes…
+        let plain = dir.join("plain.jpg");
+        std::fs::write(&plain, encode_test_jpeg(&img)).expect("write jpeg");
+        assert_eq!(crate::state::probe_dimensions(&plain), Some((2, 1)));
+        // …and a non-image extension is never probed (videos: deferred fit).
+        assert_eq!(crate::state::probe_dimensions(&dir.join("clip.mp4")), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
