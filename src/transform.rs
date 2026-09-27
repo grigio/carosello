@@ -54,16 +54,36 @@ pub struct Decoded {
 /// happen on a worker thread). The format is sniffed from the content —
 /// like the gdk-pixbuf stream loader before it — and the orientation is
 /// baked in by the same code the save pipeline uses.
+///
+/// Ceilings for the *decoded* frame live here, not in `state::MAX_DIM`
+/// (that one only clamps the on-screen size): the RGBA buffer is handed
+/// to `gdk::MemoryTexture`, and past `GL_MAX_TEXTURE_SIZE` (16384 on
+/// most drivers) the upload fails at draw time and the frame comes out
+/// black with no error anywhere. 16384² pixels also caps the buffer at
+/// 1 GiB.
+const MAX_TEX_SIDE: u32 = 16_384;
+const MAX_TEX_PIXELS: u64 = 16_384 * 16_384;
+
 pub fn decode_frame(bytes: &[u8]) -> Result<Decoded, String> {
     let format =
         image::guess_format(bytes).map_err(|e| format!("Cannot detect image format: {e}"))?;
     let orientation = media::read_exif_orientation_bytes(bytes);
     let img = image::load_from_memory_with_format(bytes, format)
         .map_err(|e| format!("Cannot decode image: {e}"))?;
-    let img = apply_exif_orientation(&img, orientation);
-    let rgba = img.to_rgba8();
-    let w = i32::try_from(rgba.width()).map_err(|_| "Image too wide".to_string())?;
-    let h = i32::try_from(rgba.height()).map_err(|_| "Image too tall".to_string())?;
+    // By value + `into_rgba8`: orientation 1 (the common case) costs no
+    // buffer copy at all, and an RGBA source isn't copied a second time.
+    let rgba = apply_exif_orientation(img, orientation).into_rgba8();
+    let (w, h) = (rgba.width(), rgba.height());
+    if w > MAX_TEX_SIDE
+        || h > MAX_TEX_SIDE
+        || u64::from(w).saturating_mul(u64::from(h)) > MAX_TEX_PIXELS
+    {
+        return Err(format!(
+            "image too large ({w}×{h}, max {MAX_TEX_SIDE}px a side)"
+        ));
+    }
+    let w = i32::try_from(w).map_err(|_| "Image too wide".to_string())?;
+    let h = i32::try_from(h).map_err(|_| "Image too tall".to_string())?;
     Ok(Decoded {
         rgba: rgba.into_raw(),
         w,
@@ -83,7 +103,7 @@ pub fn transform_bytes(bytes: &[u8], ext: &str, op: Transform) -> Result<Vec<u8>
     let orientation = media::read_exif_orientation_bytes(bytes);
     let img = image::load_from_memory_with_format(bytes, format)
         .map_err(|e| format!("Cannot decode image: {e}"))?;
-    let img = apply_exif_orientation(&img, orientation);
+    let img = apply_exif_orientation(img, orientation);
     let img = apply_transform(&img, op);
     let mut out = encode(&img, format)?;
     if format == ImageFormat::Jpeg {
@@ -127,7 +147,12 @@ fn reject_animation(bytes: &[u8], format: ImageFormat) -> Result<(), String> {
 /// screen and the file always agree. `apply_orientation_reference` in the
 /// tests checks the arms against gdk-pixbuf's own implementation of the
 /// EXIF orientation semantics.
-fn apply_exif_orientation(img: &DynamicImage, orientation: u8) -> DynamicImage {
+///
+/// Takes the image **by value**: orientation 1 returns it unchanged (the
+/// old `&self` version cloned the whole decoded buffer for nothing), and
+/// the call sites consume the result with `into_rgba8()`, so a decode is
+/// one buffer copy instead of two.
+fn apply_exif_orientation(img: DynamicImage, orientation: u8) -> DynamicImage {
     match orientation {
         2 => img.fliph(),
         3 => img.rotate180(),
@@ -136,7 +161,7 @@ fn apply_exif_orientation(img: &DynamicImage, orientation: u8) -> DynamicImage {
         6 => img.rotate90(),
         7 => img.rotate90().fliph(),
         8 => img.rotate270(),
-        _ => img.clone(),
+        _ => img,
     }
 }
 
@@ -415,7 +440,7 @@ mod tests {
 
         for orientation in 1u8..=8 {
             let want = apply_orientation_reference(&pb, orientation);
-            let got = apply_exif_orientation(&img, orientation);
+            let got = apply_exif_orientation(img.clone(), orientation);
             assert_eq!(
                 (got.width(), got.height()),
                 (

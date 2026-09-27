@@ -297,7 +297,13 @@ enum NatPart {
 impl NatPart {
     fn from_buf(buf: &str, in_digit: bool) -> Self {
         if in_digit {
-            // Leading zeros affect width tie-break so IMG02 < IMG2 < IMG10 stays stable.
+            // `NatPart`'s derived `Ord` compares (value, digit count), so
+            // the value wins and the length only breaks exact ties:
+            // IMG2 < IMG02 (leading zeros lose) and IMG2 < IMG10. The
+            // sort tests below pin this — a comment claiming the
+            // opposite used to live here.
+            // (A run too long for u64 saturates to u64::MAX, so such
+            // names all tie and fall through to the length tie-break.)
             let n = buf.parse::<u64>().unwrap_or(u64::MAX);
             NatPart::Num(n, buf.len())
         } else {
@@ -402,6 +408,32 @@ mod tests {
     fn test_collect_media_empty_missing() {
         let files = collect_media(Path::new("/nonexistent-dir-xyz"));
         assert!(files.is_empty());
+    }
+
+    /// `is_file() && is_media()` is the rule the drop handler now mirrors
+    /// (IMPROVEMENTS §1.5): only *regular* files with a media extension
+    /// get a viewer slot. A dangling symlink named `*.jpg` must not — its
+    /// extension lies and `is_file()` says no — while a symlink *to* a
+    /// real image does, because stat follows the link.
+    #[test]
+    fn test_collect_media_skips_non_regular_and_non_media() {
+        let dir = std::env::temp_dir().join(format!("carosello-collect-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        std::fs::write(dir.join("real.jpg"), b"jpeg").unwrap();
+        std::fs::write(dir.join("notes.txt"), b"text").unwrap();
+        std::os::unix::fs::symlink(dir.join("missing-target"), dir.join("dangling.jpg")).unwrap();
+        std::os::unix::fs::symlink(dir.join("real.jpg"), dir.join("link.jpg")).unwrap();
+
+        let mut got = collect_media(&dir);
+        got.sort();
+        assert_eq!(
+            got,
+            vec![dir.join("link.jpg"), dir.join("real.jpg")],
+            "regular media files only (dangling symlink excluded)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

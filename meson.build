@@ -13,8 +13,6 @@ project(
   ],
 )
 
-i18n = import('i18n')
-
 gnome = import('gnome')
 
 base_id = 'io.github.grigio.carosello'
@@ -30,11 +28,9 @@ prefix = get_option('prefix')
 bindir = prefix / get_option('bindir')
 datadir = prefix / get_option('datadir')
 libdir = prefix / get_option('libdir')
-localedir = datadir / 'locale'
 pkgdatadir = datadir / meson.project_name()
 pkglibdir = libdir / meson.project_name()
 iconsdir = datadir / 'icons'
-podir = meson.project_source_root() / 'po'
 desktop_file = pkgdatadir / '@0@.desktop'.format(base_id)
 appstream_file = pkgdatadir / '@0@.metainfo.xml'.format(base_id)
 resources = gnome.compile_resources(

@@ -2,7 +2,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use adw::prelude::*;
@@ -555,6 +555,7 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
                 if duration > 0 {
                     let ts = (value / 500.0 * duration as f64).clamp(0.0, duration as f64) as i64;
                     state.borrow_mut().seeking = true;
+                    arm_seeking_reset(&state, media.clone());
                     media.seek(ts);
                 }
             }
@@ -893,19 +894,29 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
                         first.path().is_some()
                     ));
                 }
-                // Local paths, split into files and dropped folders. Stat can
-                // fail in the sandbox while GIO still reads, so trust the
-                // extension as a last resort before giving up.
+                // Local paths, split into files and dropped folders. Both
+                // stats are allowed to fail in the sandbox (GIO may still
+                // read what stat denies), but a path only enters `paths`
+                // when it is a *regular* file **and** carries a media
+                // extension — same rule as `state::collect_media`, so a
+                // broken symlink named `clip.jpg` or a FIFO can't get a
+                // viewer slot here while being filtered out there.
                 let mut paths: Vec<PathBuf> = Vec::new();
                 let mut dirs: Vec<PathBuf> = Vec::new();
                 for p in gfiles.iter().filter_map(|f| f.path()) {
                     if p.is_dir() {
                         dirs.push(p);
-                    } else if p.is_file() || is_media(&p) {
+                    } else if p.is_file() && is_media(&p) {
                         paths.push(p);
                     }
                 }
                 if paths.is_empty() && dirs.is_empty() {
+                    // Nothing usable (pure remote URI with no FUSE path,
+                    // no media extension, unreadable stat): say so instead
+                    // of silently ignoring the drop.
+                    if !gfiles.is_empty() {
+                        show_toast(&state, "No media files found in the drop");
+                    }
                     return false;
                 }
                 // Dropped folders define their own scope (the portal exports
@@ -936,6 +947,11 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
                     files = paths.iter().filter(|p| is_media(p)).cloned().collect();
                 }
                 if files.is_empty() {
+                    // Dropped folder listing came back empty (or the
+                    // fallback filter rejected everything): tell the user.
+                    if !gfiles.is_empty() {
+                        show_toast(&state, "No media files found in the drop");
+                    }
                     return false;
                 }
                 let start_index = paths
@@ -1352,17 +1368,6 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
     }
     window.add_controller(key_ctrl);
 
-    // Let Left/Right arrow keys propagate through ScrolledWindow for navigation
-    let scrolled_key_ctrl = gtk::EventControllerKey::new();
-    scrolled_key_ctrl.set_propagation_phase(gtk::PropagationPhase::Capture);
-    scrolled_key_ctrl.connect_key_pressed(move |_, key, _, _| {
-        if key == gdk::Key::Left || key == gdk::Key::Right {
-            return glib::Propagation::Proceed;
-        }
-        glib::Propagation::Proceed
-    });
-    scrolled.add_controller(scrolled_key_ctrl);
-
     // ── Scroll: zoomed → pan; fit + two-finger mode → swipe-navigate ──
     // A 2-finger touchpad motion arrives as smooth scroll, not TouchpadSwipe
     // (libinput reserves swipe gestures for 3+ fingers), so in two-finger
@@ -1403,14 +1408,28 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
             let state = state.clone();
             let picture = picture.clone();
             let scrolled = scrolled.clone();
-            scroll_ctrl.connect_scroll_begin(move |_| {
+            scroll_ctrl.connect_scroll_begin(move |ctrl| {
                 let eligible = {
                     let s = state.borrow();
                     s.two_finger_swipe && s.zoom <= 1.05 && s.drag.is_none()
                 };
-                if eligible {
-                    drag_begin(&state, &picture, &scrolled);
+                if !eligible {
+                    return;
                 }
+                // Ctrl+scroll stays a zoom gesture: without this check the
+                // slide stage (opaque black, frozen pre-zoom frame) is put
+                // up for a gesture whose updates never run — the sibling
+                // `connect_scroll` below returns Proceed for Ctrl, and
+                // zoom_scroll_ctrl then zooms behind the dead overlay.
+                let is_ctrl = ctrl
+                    .current_event()
+                    .map(|e| e.modifier_state().contains(gdk::ModifierType::CONTROL_MASK))
+                    .unwrap_or(false);
+                if is_ctrl {
+                    debug_log!("scroll-begin: Ctrl held, not arming the slide drag");
+                    return;
+                }
+                drag_begin(&state, &picture, &scrolled);
             });
         }
         {
@@ -1875,6 +1894,44 @@ fn set_muted_state(state: &Rc<RefCell<AppState>>, muted: bool) {
     state.borrow_mut().skip_volume_update = false;
 }
 
+/// Safety net for the `seeking` flag: it is only ever cleared by the
+/// `seeking` property notify handler (near `connect_seeking_notify` at
+/// the bottom of this file), and GTK does not notify at all when it
+/// declines the seek outright (not seekable yet / stream not prepared) —
+/// the flag would then stay `true` and [`update_seek_ui`] would keep
+/// skipping the bar for the rest of that file.
+///
+/// Two stages: gentle first (clear only if GTK is *not* mid-seek, so a
+/// real seek still owns the bar), unconditional afterwards for the case
+/// where GTK set the flag and then never finished the operation.
+fn arm_seeking_reset(state: &Rc<RefCell<AppState>>, media: gtk::MediaFile) {
+    let state_c = state.clone();
+    glib::timeout_add_local_once(Duration::from_millis(500), move || {
+        // (Two statements: the borrow must end before `clear_seeking`
+        // takes a mutable one — AGENTS.md RefCell rule.)
+        let still = state_c.borrow().seeking;
+        if !still {
+            return;
+        }
+        if media.is_seeking() {
+            let state_2 = state_c.clone();
+            glib::timeout_add_local_once(Duration::from_millis(2_000), move || {
+                let still = state_2.borrow().seeking;
+                if still {
+                    clear_seeking(&state_2);
+                }
+            });
+        } else {
+            clear_seeking(&state_c);
+        }
+    });
+}
+
+fn clear_seeking(state: &Rc<RefCell<AppState>>) {
+    state.borrow_mut().seeking = false;
+    update_seek_ui(state);
+}
+
 /// Refresh seek bar + time labels + play icon from the current media position.
 /// Called from timestamp/duration/playing notifies (signal-driven, no polling).
 /// Early-outs when nothing visible would change: the formatted second, the
@@ -1892,7 +1949,14 @@ fn update_seek_ui(state: &Rc<RefCell<AppState>>) {
     let ts = media.timestamp();
     let dur_val = media.duration();
     let playing = media.is_playing();
-    let bar_unit = if dur_val > 0 { ts * 500 / dur_val } else { 0 };
+    // Raw µs straight from GStreamer: saturate the ×500 so a broken
+    // stream reporting a huge/negative timestamp can't overflow (debug
+    // builds panic, release wraps silently — no overflow checks here).
+    let bar_unit = if dur_val > 0 {
+        ts.saturating_mul(500) / dur_val
+    } else {
+        0
+    };
     let key = (
         ts / 1_000_000,
         dur_val / 1_000_000,
@@ -1946,11 +2010,21 @@ fn show_toast(state: &Rc<RefCell<AppState>>, msg: &str) {
 /// (`$XDG_RUNTIME_DIR/doc/…`). The portal exports only the explicitly
 /// opened file, so the containing directory always lists a single item
 /// and sibling navigation is impossible from such paths.
+///
+/// The directory is resolved once (`OnceLock`, same pattern as
+/// `debug_enabled` in state.rs): this runs on five call sites and built
+/// two `PathBuf`s per call. Note the cache is process-wide — a test that
+/// wants to vary `XDG_RUNTIME_DIR` must go through the raw path helper.
 fn is_doc_portal_path(path: &Path) -> bool {
-    let doc_dir = std::env::var("XDG_RUNTIME_DIR")
-        .map(|r| PathBuf::from(r).join("doc"))
-        .unwrap_or_else(|_| PathBuf::from("/run/user/1000/doc"));
-    path.starts_with(&doc_dir)
+    fn doc_dir() -> &'static Path {
+        static DOC_DIR: OnceLock<PathBuf> = OnceLock::new();
+        DOC_DIR.get_or_init(|| {
+            std::env::var("XDG_RUNTIME_DIR")
+                .map(|r| PathBuf::from(r).join("doc"))
+                .unwrap_or_else(|_| PathBuf::from("/run/user/1000/doc"))
+        })
+    }
+    path.starts_with(doc_dir())
 }
 
 /// List media directly inside `dir`: plain read_dir first, gvfs-daemon
@@ -1988,17 +2062,35 @@ fn collect_media_gio(parent: &gio::File) -> Vec<PathBuf> {
         return Vec::new();
     };
     let mut files = Vec::new();
-    while let Ok(Some(info)) = enumerator.next_file(None::<&gio::Cancellable>) {
-        if info.file_type() != gio::FileType::Regular {
-            continue;
-        }
-        let name = info.name();
-        let name_str = name.to_string_lossy();
-        if !state::is_media(Path::new(name_str.as_ref())) {
-            continue;
-        }
-        if let Some(path) = parent.child(name_str.as_ref()).path() {
-            files.push(path);
+    loop {
+        match enumerator.next_file(None::<&gio::Cancellable>) {
+            Ok(Some(info)) => {
+                if info.file_type() != gio::FileType::Regular {
+                    continue;
+                }
+                let name = info.name();
+                let name_str = name.to_string_lossy();
+                if !state::is_media(Path::new(name_str.as_ref())) {
+                    continue;
+                }
+                if let Some(path) = parent.child(name_str.as_ref()).path() {
+                    files.push(path);
+                }
+            }
+            Ok(None) => break,
+            Err(e) => {
+                // A transient EIO/permission error mid-listing used to end
+                // the loop *silently*, so the caller treated a half folder
+                // as authoritative. Keeping the partial list beats an
+                // empty one (that would read as "No Images Found"), but it
+                // is now loudly logged instead of invisible.
+                debug_log!(format!(
+                    "collect_media_gio: enumeration of {} failed after {} entries, keeping partial list: {e}",
+                    parent.uri(),
+                    files.len()
+                ));
+                break;
+            }
         }
     }
     state::sort_media_paths(&mut files);
@@ -3222,19 +3314,26 @@ fn drag_lock(state: &Rc<RefCell<AppState>>) {
     let new_is_video = state::has_ext(&path, state::VIDEO_EXTS);
     // Peek before mutating (borrow discipline).
     let have_frame = new_is_video || state.borrow().prefetch_contains(&path);
-    {
+    // (Mutate first, log after: `debug_log!` writes to stderr, which can
+    // fail — never do it inside a borrow, the rule every other call site
+    // in this file follows.)
+    let blind = {
         let mut s = state.borrow_mut();
         let Some(d) = s.drag.as_mut() else { return };
         d.new_index = new_index;
-        if !have_frame {
+        if have_frame {
+            false
+        } else {
             // Uncached: track blind, the release cuts instantly.
-            debug_log!(format!(
-                "drag-lock: no frame for {} -> blind cut",
-                path.display()
-            ));
             d.visual = false;
-            return;
+            true
         }
+    };
+    if blind {
+        debug_log!(format!(
+            "drag-lock: no frame for {} -> blind cut",
+            path.display()
+        ));
     }
     if new_is_video {
         drag_lock_video(state, &path, vw, vh, new_index);
@@ -3553,6 +3652,9 @@ fn trash_current(
     // access to the containing directory (Flatpak: --filesystem=host:rw).
     let file = gio::File::for_path(&path);
     state.borrow_mut().trashing = true;
+    // Make the rotate/mirror buttons insensitive for the whole window
+    // (re-enabled in the callback below and in show_file).
+    sync_transform_buttons(state);
     let state_c = state.clone();
     let picture_c = picture.clone();
     let scrolled_c = scrolled.clone();
@@ -3563,6 +3665,7 @@ fn trash_current(
         None::<&gio::Cancellable>,
         move |res| {
             state_c.borrow_mut().trashing = false;
+            sync_transform_buttons(&state_c);
             match res {
                 Ok(()) => finish_removal(
                     &state_c,
@@ -3611,6 +3714,7 @@ fn delete_current(
 ) {
     let file = gio::File::for_path(&path);
     state.borrow_mut().trashing = true;
+    sync_transform_buttons(state);
     let state_c = state.clone();
     let picture_c = picture.clone();
     let scrolled_c = scrolled.clone();
@@ -3620,6 +3724,7 @@ fn delete_current(
         None::<&gio::Cancellable>,
         move |res| {
             state_c.borrow_mut().trashing = false;
+            sync_transform_buttons(&state_c);
             match res {
                 Ok(()) => finish_removal(
                     &state_c,
@@ -3682,13 +3787,14 @@ fn finish_removal(
 type TransformResult = Result<(Vec<u8>, Option<std::fs::Permissions>), String>;
 
 /// Transform buttons are enabled only while showing a real image with no
-/// save in flight (disabled for videos, empty folder, and mid-save).
+/// save in flight and no trash/delete in flight (a transform started
+/// mid-trash would recreate the file being removed — see `run_transform`).
 fn sync_transform_buttons(state: &Rc<RefCell<AppState>>) {
     let (buttons, enabled) = {
         let s = state.borrow();
         (
             s.transform_btns.clone(),
-            !s.files.is_empty() && !s.is_video && !s.saving,
+            !s.files.is_empty() && !s.is_video && !s.saving && !s.trashing,
         )
     };
     for btn in buttons {
@@ -3711,7 +3817,11 @@ fn run_transform(
 ) {
     let path = {
         let s = state.borrow();
-        if s.files.is_empty() || s.is_video || s.saving {
+        // `trashing` too: an in-flight trash would have the still-present
+        // file transformed and written back at its old path, so the file
+        // the user just deleted would resurrect on disk (the mirror image
+        // of the `saving` guard in trash_current).
+        if s.files.is_empty() || s.is_video || s.saving || s.trashing {
             return;
         }
         s.files[s.index].clone()
@@ -3840,6 +3950,14 @@ fn finish_transform(
                     if current.as_deref() == Some(path_c.as_path()) {
                         show_image(&state_c, &picture_c, &scrolled_c, &path_c);
                     }
+                    // `prefetch_drop` above reopened the epoch, but only
+                    // `show_image`/`show_file` start a new round — if the
+                    // user navigated away during the save, nothing else
+                    // would, and prefetching would stay dead until the
+                    // *next* navigation (slide transitions degrade to
+                    // cuts). Start it here unconditionally; the epoch
+                    // guard makes the just-started round a no-op.
+                    prefetch_neighbors(&state_c);
                 }
                 Err((_, e)) => {
                     debug_log!(format!("transform: save failed for {}: {e}", path_c.display()));
@@ -3869,22 +3987,27 @@ fn show_file(
     // also opens a fresh epoch, letting the dispatch below (or the call
     // at the end of this function) start the new round.
     cancel_prefetch(state);
+    // Empty check + button sync happen *outside* the borrow below:
+    // `sync_transform_buttons` borrows state itself, and calling it from
+    // inside a live shared borrow is one `borrow_mut` away from the
+    // RefCell panic class AGENTS.md warns about.
+    if state.borrow().files.is_empty() {
+        // Show empty state
+        sync_transform_buttons(state);
+        let s = state.borrow();
+        if let Some(ref st) = s.empty_status {
+            st.set_visible(true);
+        }
+        scrolled.set_visible(false);
+        window.set_title(Some("Carosello"));
+        if let Some(ref wt) = s.window_title {
+            wt.set_title("Carosello");
+            wt.set_subtitle("");
+        }
+        return;
+    }
     let (path, idx, total) = {
         let s = state.borrow();
-        if s.files.is_empty() {
-            // Show empty state
-            if let Some(ref st) = s.empty_status {
-                st.set_visible(true);
-            }
-            scrolled.set_visible(false);
-            window.set_title(Some("Carosello"));
-            if let Some(ref wt) = s.window_title {
-                wt.set_title("Carosello");
-                wt.set_subtitle("");
-            }
-            sync_transform_buttons(state);
-            return;
-        }
         (s.files[s.index].clone(), s.index, s.files.len())
     };
 
@@ -4133,7 +4256,7 @@ fn spawn_decode(
                     show_toast(
                         &state_c,
                         &format!(
-                            "Failed to load {}",
+                            "Failed to load {}: {msg}",
                             path_c.file_name().unwrap_or_default().to_string_lossy()
                         ),
                     );
