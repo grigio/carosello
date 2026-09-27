@@ -9,8 +9,18 @@
 .carosello-scrolled viewport {
     background-color: black;
 }
+/* Auto-hide panels (header bar + video controls).
+   Their opacity must be driven *by CSS*: GTK4's gtk_widget_set_opacity()
+   only stores a `user_alpha` byte and queues a redraw (gtk/gtkwidget.c),
+   so it lands in a single frame and this transition never sees it — that
+   is why the panels used to pop out of existence instead of fading.
+   Opacity 0 also keeps them pickable (gtk_widget_pick ignores opacity),
+   so the invisible panels still catch the reveal hover and window drags. */
 .fade-controls {
     transition: opacity 350ms ease-in-out;
+}
+.fade-controls.faded {
+    opacity: 0;
 }
 .controls-bg {
     background-color: alpha(rgba(0,0,0,0.65), 0.9);

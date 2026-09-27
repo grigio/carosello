@@ -309,6 +309,28 @@
   `pan-begin` already sees the *new* zoom while the adjustments still hold
   the old fit range — that mismatch is the bug above.
 
+## Auto-hide panels (header / video controls)
+
+- Revealed/hidden with the CSS class `.faded` on `.fade-controls` (350 ms
+  transition), **never** `Widget::set_opacity()`: that only writes a
+  `user_alpha` byte in one frame, so the transition never sees it (panels
+  popped instead of fading). Opacity 0 stays pickable, so a hidden panel still
+  catches the reveal hover and window drags.
+- Reveal = top/bottom **25 %** band (`EDGE_THRESHOLD`) *or* hovering the panel
+  itself; anything else arms the 3 s `FADE_DELAY_MS` timer.
+- **`arm_hide` only counts real movement** (`ACTIVITY_MIN_PX`, compared against
+  the last *activity* position so a slow drift still accumulates): while a
+  video **plays**, `update_seek_ui` (~10 Hz bar steps) makes GTK re-emit motion
+  with *bit-identical* coordinates, and every no-op event ≥2.5 s old cancelled
+  and re-created the timer — deadline pushed forever ⇒ "autohide is ignored
+  while the video plays, but works when it is paused". Zone/panel cancels stay
+  positional on purpose: a pointer resting in a band must keep the panels up.
+- Diagnose with `CAROSELLO_DEBUG=1`: `panel-zone` / `panel-reveal` /
+  `panel-hide` / `panel-hide-armed` / `panel-hide-cancelled` / `panel-hide-fired`
+  carry `playing=` and a `t=` ms stamp. `CAROSELLO_TRACE_POINTER=1` adds every
+  motion event (`pointer: t=… x=… y=… same_x=… moved=…`) — a run of
+  `same_x=true` 8 ms apart *is* the spam.
+
 ## Slide navigation (prefetch / cuts)
 
 - Images animate **only on a prefetch hit** (`try_slide_to`, `drag_lock`);

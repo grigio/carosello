@@ -28,6 +28,10 @@ const FIT_EDGE_MARGIN: i32 = 48;
 /// panorama would otherwise map to a 100 px tall window).
 const FIT_MIN_W: i32 = 480;
 const FIT_MIN_H: i32 = 360;
+/// Idle delay before the panels fade out — also the window `arm_hide`
+/// re-arms against, so it lives with the helper rather than in its
+/// (clippy-sized) argument list.
+const FADE_DELAY_MS: u32 = 3000;
 
 struct AppState {
     files: Vec<PathBuf>,
@@ -542,10 +546,11 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
     // Wrap the header bar in a WindowHandle for drag support (overlay, transparent, no push)
     let top_handle = gtk::WindowHandle::new();
     top_handle.set_child(Some(&header_bar));
-    top_handle.set_opacity(0.0);
     top_handle.set_valign(gtk::Align::Start);
     top_handle.set_vexpand(false);
+    // `.faded` starts it hidden; reveal/hide toggles it (see `fade_in`).
     top_handle.add_css_class("fade-controls");
+    top_handle.add_css_class("faded");
     overlay.add_overlay(&top_handle);
 
     // ── Bottom: video controls (Showtime-style layout) ──
@@ -553,7 +558,7 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
         .orientation(gtk::Orientation::Vertical)
         .valign(gtk::Align::End)
         .halign(gtk::Align::Fill)
-        .css_classes(["fade-controls"])
+        .css_classes(["fade-controls", "faded"])
         .build();
 
     let bottom_controls = gtk::Box::builder()
@@ -735,7 +740,7 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
     bottom_outer.append(&bottom_controls);
 
     // Plain overlay on purpose: video controls must NOT drag the window.
-    bottom_outer.set_opacity(0.0);
+    // (Visibility/opacity: `.faded` from the builder, `set_visible` here.)
     bottom_outer.set_visible(false);
     overlay.add_overlay(&bottom_outer);
 
@@ -754,14 +759,27 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
     }
 
     // ── Auto-hide + mouse tracking (Showtime-style, overlay transparent, no push) ──
-    const FADE_DELAY_MS: u32 = 3000;
     const EDGE_THRESHOLD: f64 = 0.25;
+    // Motion counts as user activity only past this delta (px). Zero-delta
+    // re-emissions (a playing video re-driving pointer hover ~10×/s) must
+    // never postpone the hide deadline — that is exactly why the panels
+    // stayed visible while a video played but hid the moment it paused.
+    const ACTIVITY_MIN_PX: f64 = 0.5;
     {
         let top = top_handle.clone();
         let bottom = bottom_outer.clone();
         let hide_id: Rc<Cell<Option<glib::SourceId>>> = Rc::new(Cell::new(None));
         // Monotonic µs when `hide_id` was last armed (report #7 throttle).
         let hide_armed_us: Rc<Cell<i64>> = Rc::new(Cell::new(0));
+        // Last zone classification the overlay motion saw: −1 unknown,
+        // 0 middle, 1 top, 2 bottom. Only transitions are logged.
+        let zone: Rc<Cell<i32>> = Rc::new(Cell::new(-1));
+        // Last x sent to the raw pointer trace (detects no-op motion).
+        let last_logged: Rc<Cell<f64>> = Rc::new(Cell::new(f64::NAN));
+        // Position of the last motion event that counted as *user* activity.
+        // Compared against this (not against the previous event) so a slow
+        // drift still accumulates past the threshold. See `ACTIVITY_MIN_PX`.
+        let last_activity: Rc<Cell<(f64, f64)>> = Rc::new(Cell::new((f64::NAN, f64::NAN)));
 
         let motion_ctrl = gtk::EventControllerMotion::new();
         {
@@ -772,6 +790,9 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
             let state = state.clone();
             let window_ref = window.clone();
             let menu = menu_btn.clone();
+            let zone = zone.clone();
+            let last_logged = last_logged.clone();
+            let last_activity = last_activity.clone();
             motion_ctrl.connect_motion(move |_, x, y| {
                 {
                     let mut s = state.borrow_mut();
@@ -779,27 +800,76 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
                     s.mouse_y = y;
                     s.mouse_seen = true;
                 }
+                // "Did the pointer really move?" — a video playing drives
+                // `update_seek_ui` (≈10 Hz on the seek bar) and GTK re-emits
+                // motion for it with *bit-identical* coordinates: without
+                // this gate those no-op events re-arm the hide timer every
+                // 2.5 s and the panels never hide while a video plays
+                // (they hide correctly while it is paused).
+                let (act_x, act_y) = last_activity.get();
+                let moved = act_x.is_nan()
+                    || (x - act_x).abs() >= ACTIVITY_MIN_PX
+                    || (y - act_y).abs() >= ACTIVITY_MIN_PX;
+                if moved {
+                    last_activity.set((x, y));
+                }
                 let win_h = window_ref.height() as f64;
                 let at_top = y < win_h * EDGE_THRESHOLD;
                 let at_bottom = y > win_h * (1.0 - EDGE_THRESHOLD);
                 let in_top_zone = at_top;
                 let in_bottom_zone = at_bottom;
                 let in_any_zone = in_top_zone || in_bottom_zone;
+                let cur = if in_top_zone {
+                    1
+                } else if in_bottom_zone {
+                    2
+                } else {
+                    0
+                };
+                if zone.get() != cur {
+                    debug_log!(format!(
+                        "panel-zone: {} (y={y:.0} win_h={win_h:.0} controls_visible={} playing={})",
+                        match cur {
+                            1 => "top",
+                            2 => "bottom",
+                            _ => "middle",
+                        },
+                        bottom.is_visible(),
+                        media_playing(&state)
+                    ));
+                    zone.set(cur);
+                }
+                // Opt-in raw motion trace (`CAROSELLO_TRACE_POINTER=1`):
+                // window-relative coordinates, needed to steer a synthetic
+                // pointer into a specific zone while debugging auto-hide.
+                if pointer_trace() {
+                    let same = (x - last_logged.get()).abs() < 0.01;
+                    last_logged.set(x);
+                    debug_log!(format!(
+                        "pointer: t={} x={x:.2} y={y:.2} same_x={same} moved={moved}",
+                        trace_ms()
+                    ));
+                }
                 if in_any_zone {
-                    cancel_hide(&hide_id);
-                    top.set_opacity(1.0);
+                    cancel_hide(&hide_id, "zone");
+                    fade_in(&top, "header");
                     if bottom.is_visible() {
-                        bottom.set_opacity(1.0);
+                        fade_in(&bottom, "controls");
                     }
                 }
-                if !in_top_zone && !in_bottom_zone {
+                // Armed only by *real* motion: the reveal-zone cancel above
+                // stays positional (a pointer resting in a band must keep the
+                // panels up), but pushing the 3 s deadline back is activity
+                // and no-op motion has none.
+                if !in_top_zone && !in_bottom_zone && moved {
                     arm_hide(
                         &top,
                         &bottom,
                         &hide_id,
                         &hide_armed_us,
-                        FADE_DELAY_MS,
                         &menu,
+                        &state,
+                        "overlay-motion",
                     );
                 }
             });
@@ -828,14 +898,22 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
                 let top = top.clone();
                 let hide_id = hide_id.clone();
                 motion_top.connect_enter(move |_, _, _| {
-                    cancel_hide(&hide_id);
-                    top.set_opacity(1.0);
+                    cancel_hide(&hide_id, "header-enter");
+                    fade_in(&top, "header");
                 });
             }
             {
                 let top = top.clone();
+                let hide_id = hide_id.clone();
                 motion_top.connect_motion(move |_, _, _| {
-                    top.set_opacity(1.0);
+                    // Motion on the panel itself cancels the pending hide as
+                    // well as `enter`: the zone test only looks at `y`, so a
+                    // panel that reaches outside its 25 % band (tall video
+                    // controls in a short window — the real case, see
+                    // `motion_bottom`) would be faded out under a resting
+                    // pointer otherwise.
+                    cancel_hide(&hide_id, "header-motion");
+                    fade_in(&top, "header");
                 });
             }
             {
@@ -844,35 +922,44 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
                 let hide_id = hide_id.clone();
                 let hide_armed_us = hide_armed_us.clone();
                 let menu = menu_btn.clone();
+                let state = state.clone();
                 motion_top.connect_leave(move |_| {
                     arm_hide(
                         &top,
                         &bottom,
                         &hide_id,
                         &hide_armed_us,
-                        FADE_DELAY_MS,
                         &menu,
+                        &state,
+                        "header-leave",
                     );
                 });
             }
             top_handle.add_controller(motion_top);
         }
         {
-            let bottom = bottom_outer.clone();
+            let bottom = bottom.clone();
             let hide_id = hide_id.clone();
             let motion_bottom = gtk::EventControllerMotion::new();
             {
                 let bottom = bottom.clone();
                 let hide_id = hide_id.clone();
                 motion_bottom.connect_enter(move |_, _, _| {
-                    cancel_hide(&hide_id);
-                    bottom.set_opacity(1.0);
+                    cancel_hide(&hide_id, "controls-enter");
+                    fade_in(&bottom, "controls");
                 });
             }
             {
                 let bottom = bottom.clone();
+                let hide_id = hide_id.clone();
                 motion_bottom.connect_motion(move |_, _, _| {
-                    bottom.set_opacity(1.0);
+                    // The video controls are the only panel tall enough to
+                    // reach above the bottom 25 % band, so the overlay zone
+                    // test keeps arming a hide while the pointer rests on
+                    // them — without this cancel they faded out under the
+                    // pointer and popped back on the next micro-motion.
+                    cancel_hide(&hide_id, "controls-motion");
+                    fade_in(&bottom, "controls");
                 });
             }
             {
@@ -881,14 +968,16 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
                 let hide_id = hide_id.clone();
                 let hide_armed_us = hide_armed_us.clone();
                 let menu = menu_btn.clone();
+                let state = state.clone();
                 motion_bottom.connect_leave(move |_| {
                     arm_hide(
                         &top,
                         &bottom,
                         &hide_id,
                         &hide_armed_us,
-                        FADE_DELAY_MS,
                         &menu,
+                        &state,
+                        "controls-leave",
                     );
                 });
             }
@@ -901,15 +990,24 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
             let bottom = bottom_outer.clone();
             let hide_id = hide_id.clone();
             let hide_armed_us = hide_armed_us.clone();
+            let state = state.clone();
             menu_btn.connect_active_notify(move |btn| {
                 if btn.is_active() {
-                    cancel_hide(&hide_id);
-                    top.set_opacity(1.0);
+                    cancel_hide(&hide_id, "menu-open");
+                    fade_in(&top, "header");
                     if bottom.is_visible() {
-                        bottom.set_opacity(1.0);
+                        fade_in(&bottom, "controls");
                     }
                 } else {
-                    arm_hide(&top, &bottom, &hide_id, &hide_armed_us, FADE_DELAY_MS, btn);
+                    arm_hide(
+                        &top,
+                        &bottom,
+                        &hide_id,
+                        &hide_armed_us,
+                        btn,
+                        &state,
+                        "menu-close",
+                    );
                 }
             });
         }
@@ -922,8 +1020,10 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
                 if menuc.is_active() {
                     return;
                 }
-                top.set_opacity(0.0);
-                bottom.set_opacity(0.0);
+                debug_log!("panel-zone: outside-window");
+                zone.set(-1);
+                fade_out(&top, "header(window-leave)");
+                fade_out(&bottom, "controls(window-leave)");
             });
         }
         window.add_controller(motion_leave);
@@ -2157,9 +2257,69 @@ fn reset_scroll(scrolled: &gtk::ScrolledWindow) {
     scrolled.vadjustment().set_value(0.0);
 }
 
-// ── Auto-hide helpers (opacity-only; CSS transparencies untouched) ──
-fn cancel_hide(hide_id: &Rc<Cell<Option<glib::SourceId>>>) {
+// ── Auto-hide helpers (CSS opacity only: `.fade-controls` / `.faded`,
+//    so overlay layout/push is untouched and children keep their place) ──
+
+/// `true` while the current media file reports it is playing — logged with
+/// every arm/hide so a report like "autohide is ignored while the video
+/// plays" can be read straight off a `CAROSELLO_DEBUG` trace.
+fn media_playing(state: &Rc<RefCell<AppState>>) -> bool {
+    state
+        .borrow()
+        .media_file
+        .as_ref()
+        .is_some_and(|m| m.is_playing())
+}
+
+/// One-shot read of `CAROSELLO_TRACE_POINTER` (raw pointer trace, see the
+/// overlay motion handler). Cached because it runs on every motion event.
+fn pointer_trace() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CAROSELLO_TRACE_POINTER").is_some())
+}
+
+/// Milliseconds on the monotonic clock: only present on opt-in auto-hide
+/// trace lines, so arm/re-arm/firing rates can be measured from a log.
+fn trace_ms() -> i64 {
+    glib::monotonic_time() / 1000
+}
+
+/// Reveal a panel: dropping `.faded` lets `.fade-controls` transition the
+/// CSS `opacity` back to 1. Interrupting a fade-out simply runs the
+/// transition backwards from the current value, so a pointer re-entering
+/// the zone mid-fade picks the panel up smoothly.
+///
+/// Deliberately **not** `Widget::set_opacity()`: GTK4's version only
+/// stores a `user_alpha` byte and queues a redraw (gtk/gtkwidget.c), so it
+/// lands in one frame and no CSS transition ever sees it — that is why the
+/// panels used to pop in/out instantly despite `.fade-controls` already
+/// declaring a transition.
+///
+/// `who` is only a `CAROSELLO_DEBUG` tag, and a line is printed only when
+/// the state actually flips (motion handlers call this on every event).
+fn fade_in(panel: &impl IsA<gtk::Widget>, who: &str) {
+    if panel.has_css_class("faded") {
+        debug_log!(format!("panel-reveal: {who}"));
+        panel.remove_css_class("faded");
+    }
+}
+
+/// Hide a panel with the same 350 ms ease (see [`fade_in`]). Opacity 0
+/// stays pickable (`gtk_widget_pick` ignores opacity), so the hidden
+/// panels still catch the reveal hover and window drags.
+fn fade_out(panel: &impl IsA<gtk::Widget>, who: &str) {
+    if !panel.has_css_class("faded") {
+        debug_log!(format!("panel-hide: {who}"));
+        panel.add_css_class("faded");
+    }
+}
+
+/// Drop a pending hide timer. `why` is the `CAROSELLO_DEBUG` tag; logged
+/// only when there was a timer to drop (this runs on every motion event
+/// inside a reveal zone).
+fn cancel_hide(hide_id: &Rc<Cell<Option<glib::SourceId>>>, why: &str) {
     if let Some(id) = hide_id.take() {
+        debug_log!(format!("panel-hide-cancelled: {why} t={}", trace_ms()));
         id.remove();
     }
 }
@@ -2169,8 +2329,9 @@ fn arm_hide(
     bottom: &gtk::Box,
     hide_id: &Rc<Cell<Option<glib::SourceId>>>,
     armed_us: &Rc<Cell<i64>>,
-    delay_ms: u32,
     menu: &gtk::MenuButton,
+    state: &Rc<RefCell<AppState>>,
+    why: &str,
 ) {
     // Re-arm only when no timer is pending or the pending one is about to
     // fire (armed ≥ delay − 500 ms ago): motion events used to destroy and
@@ -2184,26 +2345,38 @@ fn arm_hide(
     if let Some(id) = hide_id.take() {
         let armed = armed_us.get();
         let fresh =
-            armed != 0 && glib::monotonic_time() - armed < (i64::from(delay_ms) - 500) * 1000;
+            armed != 0 && glib::monotonic_time() - armed < (i64::from(FADE_DELAY_MS) - 500) * 1000;
         hide_id.set(Some(id));
         if fresh {
             return;
         }
     }
-    cancel_hide(hide_id);
+    cancel_hide(hide_id, "re-arm");
     let topc = top.clone();
     let bottomc = bottom.clone();
     let hide_id2 = hide_id.clone();
     let menuc = menu.clone();
-    let sid = glib::timeout_add_local(Duration::from_millis(delay_ms as u64), move || {
+    let statec = state.clone();
+    debug_log!(format!(
+        "panel-hide-armed: {why} (in {FADE_DELAY_MS} ms) playing={} t={}",
+        media_playing(state),
+        trace_ms()
+    ));
+    let sid = glib::timeout_add_local(Duration::from_millis(FADE_DELAY_MS as u64), move || {
         // While the menu popup is open the panel stays visible (no hide under it).
         if menuc.is_active() {
             hide_id2.set(None);
             return glib::ControlFlow::Break;
         }
-        // Opacity-only fade; widgets stay in place so overlay layout/push is unchanged.
-        topc.set_opacity(0.0);
-        bottomc.set_opacity(0.0);
+        // CSS `.faded` fade-out (350 ms): widgets stay in place, so
+        // overlay layout/push is unchanged.
+        fade_out(&topc, "header(timer)");
+        fade_out(&bottomc, "controls(timer)");
+        debug_log!(format!(
+            "panel-hide-fired: playing={} t={}",
+            media_playing(&statec),
+            trace_ms()
+        ));
         hide_id2.set(None);
         glib::ControlFlow::Break
     });
