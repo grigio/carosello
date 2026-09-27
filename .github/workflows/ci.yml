@@ -151,6 +151,36 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Full history + tags: the release body lists the commits since the
+      # previous v* tag (fetch-depth must not be the default shallow clone).
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Build release notes (titles since the previous tag)
+        run: |
+          TAG="${{ github.ref_name }}"
+          # Version-sorted, newest first, minus the tag being released.
+          # `|| true`: with a single tag the grep filter matches nothing.
+          PREV=$(git tag --list 'v*' --sort=-v:refname | grep -Fxv "$TAG" | head -n1 || true)
+          if [ -n "$PREV" ]; then
+            RANGE="$PREV..$TAG"
+            HEADER="Changes since $PREV:"
+          else
+            RANGE="$TAG"          # first release: every commit up to the tag
+            HEADER="Changes in $TAG:"
+          fi
+          {
+            echo "$HEADER"
+            # Empty range (an older tag pushed after a newer one exists)
+            # would otherwise produce a body with only the header.
+            COMMITS=$(git log --format='- %s' "$RANGE" || true)
+            [ -n "$COMMITS" ] || COMMITS=$(git show -s --format='- %s' "$TAG")
+            echo "$COMMITS"
+          } > RELEASE_NOTES.md
+          echo "--- RELEASE_NOTES.md ---"
+          cat RELEASE_NOTES.md
+
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
@@ -161,6 +191,7 @@ jobs:
         with:
           tag_name: ${{ github.ref_name }}
           name: ${{ github.ref_name }}
+          body_path: RELEASE_NOTES.md
           files: |
             artifacts/carosello-linux-x86_64/carosello
             artifacts/carosello-${{ github.ref_name }}-x86_64.flatpak/carosello.flatpak
