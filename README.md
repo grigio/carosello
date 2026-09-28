@@ -25,9 +25,9 @@ Extensions match case-insensitively. Image decoding reads file contents; video c
 
 ## Installation
 
-### Arch Linux (build from source)
+### Arch Linux (per-user Meson install)
 
-Not in the AUR. A per-user Meson install under `~/.local` avoids touching Pacman files and needs no `sudo` to install.
+A per-user Meson install under `~/.local` avoids touching Pacman files and needs no `sudo` to install.
 
 Install the build and runtime dependencies:
 
@@ -68,6 +68,33 @@ This installs binary, desktop entry, AppStream metadata, and icon under `~/.loca
 meson compile -C builddir
 meson install -C builddir
 ```
+
+### Arch Linux (local package, pacman)
+
+Build a package from this checkout and install it system-wide with pacman. The package is built locally with `makepkg` — there is no AUR recipe.
+
+Install the build and test dependencies (the GStreamer sets above stay optional):
+
+```bash
+sudo pacman -S --needed \
+  base-devel git meson rust gtk4 libadwaita \
+  hicolor-icon-theme desktop-file-utils appstream gdk-pixbuf2
+```
+
+Then from the repository root:
+
+```bash
+makepkg -si
+```
+
+`-s` resolves missing dependencies through pacman, `-i` installs the package it just built (a `sudo` prompt — add `--noconfirm` in scripts). To build and install as two steps:
+
+```bash
+makepkg
+sudo pacman -U carosello-*.pkg.tar.zst
+```
+
+`PKGBUILD` downloads the release tarball named by `pkgver` from the GitHub tag, so `makepkg` builds the **tagged source, not your working tree** — for local changes use the Meson or Cargo build above. A run also leaves `src/carosello-*/` and `src/*.tar.gz` behind (gitignored): `rm -rf src/carosello-*` when done, and never `git add -A` right after a package build.
 
 ### Flatpak artifact
 

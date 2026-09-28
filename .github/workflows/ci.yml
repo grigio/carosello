@@ -21,10 +21,8 @@ jobs:
           CARGO=$(grep '^version =' Cargo.toml | cut -d'"' -f2)
           META=$(grep -oP '<release version="\K[0-9.]+' data/*.metainfo.xml | head -1)
           PKG=$(grep '^pkgver=' PKGBUILD | cut -d= -f2)
-          SRC=$(grep -m1 'pkgver =' .SRCINFO | cut -d= -f2 | tr -d ' \t')
           [ "$CARGO" = "$META" ] || { echo "metainfo $META != cargo $CARGO"; exit 1; }
           [ "$CARGO" = "$PKG" ] || { echo "PKGBUILD $PKG != cargo $CARGO"; exit 1; }
-          [ "$CARGO" = "$SRC" ] || { echo ".SRCINFO $SRC != cargo $CARGO"; exit 1; }
           echo "versions in sync: $CARGO"
 
       - name: Check tag matches Cargo.toml

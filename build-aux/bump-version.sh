@@ -7,7 +7,6 @@
 #   Cargo.toml            (source of truth; Cargo.lock refreshes on next cargo build)
 #   data/*.metainfo.xml   (prepends a <release> entry dated today)
 #   PKGBUILD              (pkgver, resets pkgrel to 1)
-#   .SRCINFO              (regenerated via makepkg --printsrcinfo)
 #
 # Flatpak needs nothing: it builds from the source dir and its user-visible
 # version comes from the metainfo <release> entries. The in-app About dialog
@@ -50,7 +49,6 @@ with open(path, "w") as f:
 print(f"metainfo: added release {ver}")
 EOF
 
-# 3. PKGBUILD + .SRCINFO (pkgver must stay literal for makepkg/AUR)
+# 3. PKGBUILD (pkgver must stay literal for makepkg)
 sed -i "s/^pkgver=.*/pkgver=$V/; s/^pkgrel=.*/pkgrel=1/" "$ROOT/PKGBUILD"
-(cd "$ROOT" && makepkg --printsrcinfo > .SRCINFO)
 echo "bumped to $V"

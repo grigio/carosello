@@ -1,8 +1,9 @@
 # Maintainer: grigio <https://github.com/grigio>
 # Arch Linux package for Carosello — fast, minimalist image/video viewer (GTK4/libadwaita).
-# AUR usage:
-#   git clone https://aur.archlinux.org/carosello.git && cd carosello && makepkg -si
-# Or with an AUR helper: yay -S carosello  /  paru -S carosello
+# Local usage (not published to the AUR) — run from the repo root:
+#   makepkg -si                     # build, then install with pacman
+#   makepkg && sudo pacman -U carosello-*.pkg.tar.zst
+# Non-TTY shells: pass --noconfirm to makepkg/pacman (the [Y/n] prompt hangs).
 
 pkgname=carosello
 pkgver=1.3.0

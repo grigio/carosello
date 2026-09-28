@@ -79,7 +79,7 @@
     </release>
     <release version="1.1.0" date="2026-09-22">
       <description>
-        <p>Arch Linux packaging (PKGBUILD/AUR), full image/video file associations, and single-source versioning across Cargo, Meson, Flatpak and Arch.</p>
+        <p>Arch Linux packaging (PKGBUILD), full image/video file associations, and single-source versioning across Cargo, Meson, Flatpak and Arch.</p>
       </description>
     </release>
     <release version="1.0.8" date="2026-09-21">
