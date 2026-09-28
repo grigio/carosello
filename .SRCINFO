@@ -27,6 +27,6 @@ pkgbase = carosello
 	source = cargo-lock.patch
 	sha256sums = ec5a08b1ee1f11c4e161775ab2e74cd879893908f2f3c387f5f8f0d316da90f5
 	sha256sums = 3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986
-	sha256sums = 01ca5796700277d4e39d6a848bf55909f2a5a98e17817421f2102666dc416c45
+	sha256sums = b52cfa592a6538b935ced8fb10c253fa63e497e3aa3bb25c6b7754c184e11e43
 
 pkgname = carosello
