@@ -21,9 +21,15 @@ use crate::zoom::{self, ZoomPaintable};
 /// video fit compares against to tell "untouched" from "user resized").
 const DEFAULT_WINDOW_W: i32 = 900;
 const DEFAULT_WINDOW_H: i32 = 600;
-/// The initial fit keeps this much screen edge free on every side, so a
-/// huge first item maps as a big *window*, not a screen-filling one.
+/// The initial fit keeps this much screen edge free vertically, so a tall
+/// item maps as a big *window*, not a screen-filling one (it is what caps
+/// the 50 %-wide window's height).
 const FIT_EDGE_MARGIN: i32 = 48;
+/// The window opens this wide — a percentage of the monitor width,
+/// *whatever* the item is. The width is the given; the height follows the
+/// item's aspect ratio (and is then clamped to the screen, see
+/// [`fit_content`]).
+const FIT_WIDTH_PERCENT: i32 = 50;
 /// …and never opens below this, whatever the first item is (a 100 px tall
 /// panorama would otherwise map to a 100 px tall window).
 const FIT_MIN_W: i32 = 480;
@@ -285,7 +291,7 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
         .css_classes(["carosello-window"])
         .build();
 
-    // ── Initial fit: open at the first item's own size ──
+    // ── Initial fit: open at half a screen wide, item's aspect tall ──
     // Images are probed from their headers *before* the window maps, so
     // it appears at the right size from the first frame; a video's size
     // only exists once its pipeline prepares, so that fit is deferred to
@@ -4260,8 +4266,8 @@ fn finish_transform(
 /// Largest monitor attached to the default display, `(w, h)` in logical
 /// pixels. Taken across monitors because the compositor picks the one the
 /// window opens on; GTK also clamps the map to the *actual* output bounds
-/// — this only reserves [`FIT_EDGE_MARGIN`] so a huge item maps as a big
-/// window instead of a screen-filling one.
+/// — this only supplies the reference for the [`FIT_WIDTH_PERCENT`] width
+/// and the [`FIT_EDGE_MARGIN`] height reserve.
 fn max_monitor_bounds() -> Option<(i32, i32)> {
     let display = gdk::Display::default()?;
     let monitors = display.monitors();
@@ -4283,24 +4289,33 @@ fn max_monitor_bounds() -> Option<(i32, i32)> {
 /// Media size → window *content* size (GTK's "default size": the CSD
 /// shadow is added on top of that by GTK itself).
 ///
-/// Keeps the aspect, never grows the item past `bounds` minus
-/// [`FIT_EDGE_MARGIN`] and never shrinks it below [`FIT_MIN_W`] ×
-/// [`FIT_MIN_H`]. `bounds: None` (no display info) only floors — GTK
-/// clamps the actual map to the real output anyway.
+/// The width is always [`FIT_WIDTH_PERCENT`] of `bounds` — for *every*
+/// item, big or tiny — and the height is derived from the item's own
+/// aspect ratio. A portrait item would poke past the bottom of the screen
+/// that way, so both sides then shrink together (aspect still locked)
+/// until the height fits `bounds` minus [`FIT_EDGE_MARGIN`]. Last the
+/// [`FIT_MIN_W`] × [`FIT_MIN_H`] floor applies, which is the only step
+/// allowed to break the aspect (an extreme panorama would otherwise be a
+/// few dozen pixels tall).
+///
+/// `bounds: None` (no display info) has nothing to take 50 % of, so the
+/// item keeps its own size — GTK clamps the actual map to the real output
+/// anyway.
 fn fit_content(iw: i32, ih: i32, bounds: Option<(i32, i32)>) -> (i32, i32) {
     if iw <= 0 || ih <= 0 {
         return (DEFAULT_WINDOW_W, DEFAULT_WINDOW_H);
     }
     let (mut w, mut h) = (iw, ih);
     if let Some((bw, bh)) = bounds {
-        let max_w = (bw - 2 * FIT_EDGE_MARGIN).max(FIT_MIN_W);
+        // Half a screen wide (a `bw/2` window always leaves far more than
+        // `FIT_EDGE_MARGIN` free on each side), height from the aspect.
+        w = bw * FIT_WIDTH_PERCENT / 100;
+        h = (f64::from(w) * f64::from(ih) / f64::from(iw)).round() as i32;
         let max_h = (bh - 2 * FIT_EDGE_MARGIN).max(FIT_MIN_H);
-        let scale = (f64::from(max_w) / f64::from(w))
-            .min(f64::from(max_h) / f64::from(h))
-            .min(1.0);
-        if scale < 1.0 {
+        if h > max_h {
+            let scale = f64::from(max_h) / f64::from(h);
             w = (f64::from(w) * scale).round() as i32;
-            h = (f64::from(h) * scale).round() as i32;
+            h = max_h;
         }
     }
     (w.max(FIT_MIN_W), h.max(FIT_MIN_H))
@@ -5176,35 +5191,40 @@ mod tests {
     }
 
     #[test]
-    fn test_fit_content_leaves_an_item_that_already_fits_alone() {
-        assert_eq!(fit_content(1024, 768, Some((1560, 1040))), (1024, 768));
+    fn test_fit_content_is_half_a_screen_wide_with_the_items_aspect() {
+        // Same width for a big and a small item — the height is what
+        // carries the item's own aspect ratio.
+        let screen = (1560, 1040);
+        let half = screen.0 * FIT_WIDTH_PERCENT / 100;
+        assert_eq!(fit_content(1024, 768, Some(screen)), (half, 585));
+        assert_eq!(fit_content(4000, 3000, Some(screen)), (half, 585));
+        // A tiny item opens *bigger* than itself: 50 % is the width now.
+        assert_eq!(fit_content(64, 64, Some(screen)), (half, half));
     }
 
     #[test]
-    fn test_fit_content_scales_a_huge_item_into_the_margin() {
-        // 4000×3000 on a 1560×1040 screen: height binds, aspect survives
-        // rounding, and the window stays clear of the screen edges.
-        let (w, h) = fit_content(4000, 3000, Some((1560, 1040)));
+    fn test_fit_content_shrinks_a_portrait_item_to_the_screen_height() {
+        // 3000×4000 on a 1560×1040 screen: half a screen wide would be
+        // 1040 tall (past the bottom edge), so both sides come down
+        // together — aspect survives rounding, width stays ≤ half.
+        let (w, h) = fit_content(3000, 4000, Some((1560, 1040)));
         assert_eq!(h, 1040 - 2 * FIT_EDGE_MARGIN);
         assert!(
-            (f64::from(w) / f64::from(h) - 4.0 / 3.0).abs() < 0.01,
+            (f64::from(w) / f64::from(h) - 0.75).abs() < 0.01,
             "aspect drifted: {w}x{h}"
         );
-        assert!(w <= 1560 - 2 * FIT_EDGE_MARGIN);
+        assert!(w <= 1560 * FIT_WIDTH_PERCENT / 100);
     }
 
     #[test]
     fn test_fit_content_floors_tiny_and_flat_items() {
-        // A tiny item still opens a usable window…
-        assert_eq!(
-            fit_content(64, 64, Some((1560, 1040))),
-            (FIT_MIN_W, FIT_MIN_H)
-        );
-        // …and a panorama gets a floor on height instead of mapping 73 px
-        // tall (width still obeys the bounds margin).
+        // A monitor narrow enough that half of it lands under the floor…
+        assert_eq!(fit_content(64, 64, Some((800, 600))), (FIT_MIN_W, 400));
+        // …and a panorama gets a floor on height instead of mapping 39 px
+        // tall (the floor is the one step allowed to break the aspect).
         assert_eq!(
             fit_content(4000, 200, Some((1560, 1040))),
-            (1560 - 2 * FIT_EDGE_MARGIN, FIT_MIN_H)
+            (1560 * FIT_WIDTH_PERCENT / 100, FIT_MIN_H)
         );
     }
 

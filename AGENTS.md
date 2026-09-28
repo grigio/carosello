@@ -239,7 +239,7 @@
   the stale `prefetch` entry, re-enable buttons, re-run `show_image()`
   only if the path is still the current index.
 
-## Initial window fit (first item sizes the window)
+## Initial window fit (half a screen wide, item's aspect)
 
 - `AppState.startup_fit: Option<(usize, (i32, i32))>` = *(index the fit is
   owed to, default size the window was created with)* — set once in
@@ -261,10 +261,18 @@
   can still land before the first allocation, so it often maps straight at
   the final size; when it doesn't, the window resizes once — accepted, and
   exactly why the guard exists.
-- `fit_content(iw, ih, bounds)` is pure (unit-tested): keep aspect,
-  clamp inside `max_monitor_bounds()` − `FIT_EDGE_MARGIN` (48 px per
-  side, GTK adds the CSD shadow itself), floor at `FIT_MIN_W/H`
-  (480×360). `bounds: None` only floors; GTK clamps the real map.
+- `fit_content(iw, ih, bounds)` is pure (unit-tested) and now = **width
+  `FIT_WIDTH_PERCENT` (50 %) of `max_monitor_bounds()`, height from the
+  item's aspect ratio** — every first item opens half a screen wide, so a
+  small item gets a window *bigger* than itself (64×64 → 780×780 on a
+  1560-wide screen). Only a **portrait** item then shrinks both sides
+  together, aspect still locked, to fit `bounds` − `FIT_EDGE_MARGIN`
+  (48 px vertically; GTK adds the CSD shadow itself); last the
+  `FIT_MIN_W/H` floor (480×360) applies, the one step allowed to break
+  the aspect (a panorama maps 780×360, not 780×78). `bounds: None` has
+  no 50 % to take, so the item keeps its own size; GTK clamps the real
+  map. Measured on this machine (1560×1040 logical): 1776×1392 →
+  **780×611**, 900×1600 → **531×944**, 4000×400 → **780×360**.
 - The RefCell trap here is the `if let Some(…) = state.borrow()…`
   scrutinee: the `Ref` lives for the whole block, so the `fit` inside the
   body panics. Probe into a `let` **before** the `if` (see the comment in
