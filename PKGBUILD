@@ -6,7 +6,7 @@
 # Non-TTY shells: pass --noconfirm to makepkg/pacman (the [Y/n] prompt hangs).
 
 pkgname=carosello
-pkgver=1.3.0
+pkgver=1.3.1
 pkgrel=1
 pkgdesc="A fast, minimalist image and video viewer for Linux (GTK4/libadwaita)"
 arch=('x86_64' 'aarch64')

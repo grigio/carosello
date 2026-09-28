@@ -47,6 +47,11 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="1.3.1" date="2026-09-28">
+      <description>
+        <p>The initial window opens half a screen wide with the item's own aspect ratio, and AUR packaging is gone: the Arch package is now built and installed locally with makepkg and pacman.</p>
+      </description>
+    </release>
     <release version="1.3.0" date="2026-09-28">
       <description>
         <p>Window sizes itself to the first media item, a file opened from Files appears in the already-running window, and the header/video panels keep auto-hiding while a video plays. Plus assorted fixes and CI improvements.</p>
