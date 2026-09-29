@@ -365,6 +365,32 @@
   (no `prefetch <path>: …` error line ⇒ still decoding; the debug build
   decodes 9 MP JPEGs several times slower than release).
 
+## Seek-bar scrub (issue #2: "freeze on seek-bar hold")
+
+- A click-hold drag on the seek bar emits `change-value` **per pointer
+  motion** (~40-80/s) and every event used to issue a flushing
+  `gst_play_seek` on the UI thread — measured **705 seeks in 9 s (78/s)**
+  on a realistic 40-motion/s drag. The hard freeze itself was *not*
+  reproducible here (host build, 1080p + 4K, muted/unmuted: `media.seek`
+  never >5 ms, main loop never blocked); one intermittent wedge did show
+  up — after a drag to EOS the pipeline could sit at the last frame with
+  no loop (~1/3 of runs) — and it disappeared with the throttle (4/4
+  clean drag-to-EOS cycles after).
+- Fix = `Scrub` in `AppState` (`window.rs`): rate-limit to one seek per
+  `SCRUB_WINDOW_US` (100 ms) + a single **trailing** timeout seek for the
+  released position, dedup via `issued` (a held-still pointer re-fires
+  the same value), and a media-current check in the trailing timeout
+  (a navigation within the window would otherwise seek the dead old
+  pipeline). A plain click still seeks immediately (first event of a
+  window always fires).
+- `SCRUB_HOLD_US` (300 ms) gives the pointer ownership of the bar:
+  `seeking` flips false on every seek-done, so without `Scrub::held()`
+  `update_seek_ui` yanked the bar back to the lagging pipeline position
+  **mid-drag** on each completed seek. Verify with `CAROSELLO_DEBUG=1`:
+  `change-value` vs `scrub seek` counts (706 → 92 for a 9 s drag, max
+  gap 101 ms) and **zero `seek-ui: bar <-` lines inside the drag span**
+  (`via=trailing` must match the last `change-value` ts).
+
 ## GUI automation (interactive tests on this machine)
 
 - `ydotoold` already runs in the user session:

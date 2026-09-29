@@ -38,6 +38,16 @@ const FIT_MIN_H: i32 = 360;
 /// re-arms against, so it lives with the helper rather than in its
 /// (clippy-sized) argument list.
 const FADE_DELAY_MS: u32 = 3000;
+/// Minimum gap between interactive seek-bar seeks, µs (issue #2): during a
+/// click-hold drag `change-value` fires on every pointer motion (~40-80/s)
+/// and each event used to issue a flushing `gst_play_seek` on the UI
+/// thread. The pipeline only needs ~10 positions/s to feel live; the final
+/// position is always honoured by one trailing seek (see [`Scrub`]).
+const SCRUB_WINDOW_US: i64 = 100_000;
+/// How long after the last scrub event the seek bar stays owned by the
+/// pointer, µs: `seeking` flips false on every seek-done, which otherwise
+/// yanks the bar back to the lagging pipeline position mid-drag.
+const SCRUB_HOLD_US: i64 = 300_000;
 
 struct AppState {
     files: Vec<PathBuf>,
@@ -65,6 +75,9 @@ struct AppState {
     pending_update: bool,
     is_video: bool,
     seeking: bool,
+    /// Seek-bar scrub throttle + pointer-hold marker (issue #2, see
+    /// [`Scrub`]).
+    scrub: Scrub,
     skip_volume_update: bool,
     video_gen: u64,
     video_w: i32,
@@ -129,6 +142,46 @@ struct AppState {
     /// so exactly one item — the first shown — may size the window. See
     /// `fit_window_to_media`.
     startup_fit: Option<(usize, (i32, i32))>,
+}
+
+/// Seek-bar scrub state (issue #2): `change-value` fires on every pointer
+/// motion during a click-hold drag and used to issue a flushing
+/// `gst_play_seek` on the UI thread for each one (measured: ~78 seeks/s).
+/// The handler rate-limits to one seek per [`SCRUB_WINDOW_US`] plus a
+/// single trailing seek for the released position; `hold_us` keeps the
+/// `seeking`-notify driven updates from yanking the bar away from the
+/// pointer mid-drag.
+#[derive(Clone, Copy)]
+struct Scrub {
+    /// Latest target waiting for the next window / the trailing seek.
+    pending: Option<i64>,
+    /// Last target actually handed to the pipeline — dedup, since a
+    /// held-still pointer re-fires the same value on every press.
+    issued: Option<i64>,
+    /// Monotonic µs of the last issued seek (rate-limit window start).
+    last_us: i64,
+    /// A trailing timeout is already scheduled.
+    armed: bool,
+    /// Monotonic µs of the last interactive event.
+    hold_us: i64,
+}
+
+impl Scrub {
+    fn new() -> Self {
+        Self {
+            pending: None,
+            issued: None,
+            last_us: 0,
+            armed: false,
+            hold_us: 0,
+        }
+    }
+
+    /// The pointer owns the bar: no pipeline-driven `set_value` while the
+    /// user is on (or just left) the seek bar.
+    fn held(&self) -> bool {
+        glib::monotonic_time() - self.hold_us < SCRUB_HOLD_US
+    }
 }
 
 /// One interactive swipe drag: the outgoing frame plus the incoming
@@ -239,6 +292,7 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
         pending_update: false,
         is_video: false,
         seeking: false,
+        scrub: Scrub::new(),
         skip_volume_update: false,
         video_gen: 0,
         video_w: 0,
@@ -612,6 +666,10 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
     // User-driven seeks via change-value (only fires for interaction, not for
     // programmatic set_value from timestamp notifies — no feedback loop).
     // Native click-to-seek is kept; no custom click math (RTL/padding safe).
+    // The drag emits one event per pointer motion and each used to seek
+    // right away (issue #2: a flushing gst seek per event on the UI
+    // thread); see [`Scrub`] for the throttle — a click still seeks at
+    // once, a drag at most [`SCRUB_WINDOW_US`] plus one trailing seek.
     {
         let state = state.clone();
         seek_scale.connect_change_value(move |_, _, value| {
@@ -625,9 +683,63 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
             if let Some(media) = media {
                 if duration > 0 {
                     let ts = (value / 500.0 * duration as f64).clamp(0.0, duration as f64) as i64;
-                    state.borrow_mut().seeking = true;
-                    arm_seeking_reset(&state, media.clone());
-                    media.seek(ts);
+                    debug_log!(format!(
+                        "seek-bar: change-value v={value:.1} -> ts={ts} (t={})",
+                        epoch_ms()
+                    ));
+                    let now = glib::monotonic_time();
+                    let fire_now = {
+                        let mut s = state.borrow_mut();
+                        s.scrub.pending = Some(ts);
+                        s.scrub.hold_us = now;
+                        now - s.scrub.last_us >= SCRUB_WINDOW_US && s.scrub.issued != Some(ts)
+                    };
+                    if fire_now {
+                        issue_scrub(&state, &media, ts, "immediate");
+                    } else {
+                        // One trailing timeout per window at most; it takes
+                        // whatever `pending` holds by the time it fires, so
+                        // the released position is always what gets seeked.
+                        let wait = {
+                            let mut s = state.borrow_mut();
+                            let w = s.scrub.last_us + SCRUB_WINDOW_US - now;
+                            if w > 0 && !s.scrub.armed && s.scrub.pending != s.scrub.issued {
+                                s.scrub.armed = true;
+                                w
+                            } else {
+                                0
+                            }
+                        };
+                        if wait > 0 {
+                            let state_t = state.clone();
+                            let media_t = media.clone();
+                            glib::timeout_add_local_once(
+                                Duration::from_micros(wait as u64),
+                                move || {
+                                    let (ts, current) = {
+                                        let mut s = state_t.borrow_mut();
+                                        s.scrub.armed = false;
+                                        // The trailing seek belongs to the
+                                        // gesture: keep the bar held across it.
+                                        s.scrub.hold_us = glib::monotonic_time();
+                                        let pending = s.scrub.pending.take();
+                                        let ts = match pending {
+                                            Some(t) if Some(t) != s.scrub.issued => Some(t),
+                                            _ => None,
+                                        };
+                                        // A navigation in between swapped the
+                                        // media: don't seek the dead pipeline.
+                                        let current =
+                                            s.media_file.as_ref().is_some_and(|m| m == &media_t);
+                                        (ts, current)
+                                    };
+                                    if let (Some(ts), true) = (ts, current) {
+                                        issue_scrub(&state_t, &media_t, ts, "trailing");
+                                    }
+                                },
+                            );
+                        }
+                    }
                 }
             }
             glib::Propagation::Proceed
@@ -2151,15 +2263,42 @@ fn clear_seeking(state: &Rc<RefCell<AppState>>) {
     update_seek_ui(state);
 }
 
+/// Hand one throttled position to the pipeline: the immediate and the
+/// trailing path of the seek-bar scrub share the bookkeeping here —
+/// `issued`/window start, `seeking` ownership (with its safety-net arm)
+/// and the seek itself. Called at most ~once per [`SCRUB_WINDOW_US`].
+fn issue_scrub(state: &Rc<RefCell<AppState>>, media: &gtk::MediaFile, ts: i64, via: &str) {
+    {
+        let mut s = state.borrow_mut();
+        s.scrub.pending = None;
+        s.scrub.issued = Some(ts);
+        s.scrub.last_us = glib::monotonic_time();
+        s.seeking = true;
+    }
+    arm_seeking_reset(state, media.clone());
+    let t0 = std::time::Instant::now();
+    media.seek(ts);
+    let dt = t0.elapsed();
+    debug_log!(format!(
+        "seek-bar: scrub seek ts={ts} via={via} (t={}){}",
+        epoch_ms(),
+        if dt > Duration::from_millis(5) {
+            format!(" seek={dt:?}")
+        } else {
+            String::new()
+        }
+    ));
+}
+
 /// Refresh seek bar + time labels + play icon from the current media position.
 /// Called from timestamp/duration/playing notifies (signal-driven, no polling).
 /// Early-outs when nothing visible would change: the formatted second, the
 /// seek bar's own 500-step position, play state and the seeking flag
 /// (report #9 — this ran the full set on every GStreamer position tick).
 fn update_seek_ui(state: &Rc<RefCell<AppState>>) {
-    let (media, seeking, is_vid) = {
+    let (media, seeking, held, is_vid) = {
         let s = state.borrow();
-        (s.media_file.clone(), s.seeking, s.is_video)
+        (s.media_file.clone(), s.seeking, s.scrub.held(), s.is_video)
     };
     let Some(media) = media else { return };
     if !is_vid {
@@ -2197,10 +2336,19 @@ fn update_seek_ui(state: &Rc<RefCell<AppState>>) {
             s.play_pause_btn.clone(),
         )
     };
-    if !seeking {
+    // Bar follows the pipeline only when the pointer doesn't own it:
+    // mid-scrub `seeking` flips false on every seek-done, and without the
+    // `held` check each flip yanked the bar back to the lagging position
+    // while the user was still dragging (issue #2 jank).
+    if !seeking && !held {
         if let Some(scale) = scale {
             if dur_val > 0 {
-                scale.set_value((ts as f64 / dur_val as f64) * 500.0);
+                let v = (ts as f64 / dur_val as f64) * 500.0;
+                debug_log!(format!(
+                    "seek-ui: bar <- {v:.1} (ts={ts} dur={dur_val} t={})",
+                    epoch_ms()
+                ));
+                scale.set_value(v);
             }
         }
     }
@@ -2373,6 +2521,16 @@ fn pointer_trace() -> bool {
 /// trace lines, so arm/re-arm/firing rates can be measured from a log.
 fn trace_ms() -> i64 {
     glib::monotonic_time() / 1000
+}
+
+/// Wall-clock milliseconds since the epoch — the stamp on the opt-in
+/// `CAROSELLO_DEBUG` lines that need rates/durations measurable from a
+/// log (seek-bar scrub, `seek-ui` refreshes).
+fn epoch_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
 }
 
 /// Reveal a panel: dropping `.faded` lets `.fade-controls` transition the
