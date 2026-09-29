@@ -592,7 +592,7 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
     let position_label = gtk::Label::builder()
         .label("0:00")
         .halign(gtk::Align::Start)
-        .css_classes(["time-label", "caption", "monospace", "numeric"])
+        .css_classes(["time-label", "caption", "numeric"])
         .build();
     position_label.set_xalign(0.0);
     // a11y: time labels should be numeric and respect text scaling via caption
@@ -662,7 +662,7 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
     let duration_label = gtk::Label::builder()
         .label("0:00")
         .halign(gtk::Align::End)
-        .css_classes(["time-label", "caption", "monospace", "numeric"])
+        .css_classes(["time-label", "caption", "numeric"])
         .build();
     duration_label.set_xalign(1.0);
     duration_label.update_property(&[gtk::accessible::Property::Label("Total duration")]);

@@ -27,14 +27,23 @@
     border-radius: 18px;
     padding: 2px;
 }
+/* Issue #4: a translucent-black bar sitting on the window's black letterbox
+   is *pixel-identical* to it (0.65×0.9 = 58.5 % black over #000 = #000), so
+   the bar had no readable edge there — only its contents floated. A 1px
+   hairline gives the shape back. It is a *solid* grey, not alpha(white,…):
+   an alpha-white ring over bright media composites to ~invisible, while #4d4d4d
+   still reads against both #000 and a blown-out frame. */
 .controls-bg-top {
     background-color: alpha(rgba(0,0,0,0.65), 0.9);
     padding: 0;
+    border-bottom: 1px solid #4d4d4d;
 }
 .controls-bg-bottom {
     background-color: alpha(rgba(0,0,0,0.65), 0.9);
     border-radius: 18px;
     padding: 8px 12px;
+    /* Drawn outside the border box: no layout shift, follows the 18px radius */
+    box-shadow: 0 0 0 1px #4d4d4d;
 }
 .empty-label {
     color: alpha(white, 0.6);
@@ -44,24 +53,29 @@
     background-color: alpha(white, 0.15);
     border-radius: 999px;
     padding: 4px;
-    min-width: 30px;
-    min-height: 30px;
+    /* Adwaita's own buttons are 34px tall — keep the OSD circles on the same
+       grid instead of the old 30px, so they read as standard controls */
+    min-width: 34px;
+    min-height: 34px;
     color: white;
+    border-width: 0;
+    transition: background-color 150ms ease-in-out;
 }
 .ctrl-btn:hover {
     background-color: alpha(white, 0.3);
 }
 .ctrl-btn:active {
-    background-color: alpha(white, 0.4);
+    background-color: alpha(white, 0.45);
 }
 .seek-bar trough {
     background-color: alpha(white, 0.2);
     border-radius: 4px;
     min-height: 4px;
     padding: 0;
-    transition: min-height 200ms ease-in-out;
+    transition: min-height 200ms ease-in-out, background-color 150ms ease-in-out;
 }
 .seek-bar:hover trough {
+    background-color: alpha(white, 0.3);
     min-height: 6px;
 }
 .seek-bar trough highlight {
@@ -86,8 +100,10 @@
 }
 .time-label {
     color: alpha(white, 0.85);
+    /* UI font, but with fixed-width digits so the seek bar doesn't twitch
+       between 0:09 → 0:10 (the old monospace family looked out of place
+       next to the rest of the CSD chrome). */
     font-variant-numeric: tabular-nums;
-    font-family: monospace;
     min-width: 48px;
 }
 .volume-bar trough {
@@ -95,11 +111,19 @@
     border-radius: 4px;
     min-height: 4px;
     padding: 0;
+    transition: min-height 200ms ease-in-out, background-color 150ms ease-in-out;
+}
+.volume-bar:hover trough {
+    background-color: alpha(white, 0.3);
+    min-height: 6px;
 }
 .volume-bar trough highlight {
     background-color: alpha(white, 0.7);
     border-radius: 4px;
     min-height: 4px;
+}
+.volume-bar:hover trough highlight {
+    min-height: 6px;
 }
 .volume-bar trough slider {
     background-color: white;
