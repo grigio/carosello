@@ -101,6 +101,10 @@ struct AppState {
     /// User pref: two-finger swipe navigates (instead of three-finger).
     /// Off by default; touchpad drags and discrete swipes gate on it.
     two_finger_swipe: bool,
+    /// User pref: videos open muted (default on — issue #3). The moment
+    /// the user unmutes, the new choice is saved and every later video
+    /// opens with it; muting again saves it back.
+    video_muted: bool,
     /// Rotate/mirror header buttons: kept here to enable/disable them
     /// (disabled for videos, empty folder, and while a save is in flight).
     transform_btns: Vec<gtk::Button>,
@@ -216,8 +220,8 @@ impl AppState {
 pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWindow {
     css::load_css();
 
-    // Both prefs from a single settings read (report #8: was two reads).
-    let (slide_enabled, two_finger_swipe) = state::load_prefs();
+    // All prefs from a single settings read (report #8: was two reads).
+    let (slide_enabled, two_finger_swipe, video_muted) = state::load_prefs();
 
     let state: Rc<RefCell<AppState>> = Rc::new(RefCell::new(AppState {
         files: Vec::new(),
@@ -260,6 +264,7 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
         drag: None,
         slide_enabled,
         two_finger_swipe,
+        video_muted,
         transform_btns: Vec::new(),
         saving: false,
         trashing: false,
@@ -713,6 +718,9 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
                 if let Some(btn) = btn {
                     update_mute_button(&btn, muted);
                 }
+                // Dragging to zero *is* muting: remember it like the
+                // button / M do (issue #3).
+                remember_mute(&state, muted);
             }
         });
     }
@@ -2048,6 +2056,7 @@ fn toggle_play_pause(state: &Rc<RefCell<AppState>>) {
 
 /// Single place for mute + volume-slider sync (avoids the three divergent copies).
 fn set_muted_state(state: &Rc<RefCell<AppState>>, muted: bool) {
+    remember_mute(state, muted);
     let (media, btn, scale) = {
         let s = state.borrow();
         (
@@ -2078,6 +2087,30 @@ fn set_muted_state(state: &Rc<RefCell<AppState>>, muted: bool) {
         }
     }
     state.borrow_mut().skip_volume_update = false;
+}
+
+/// Remember the mute choice for the *next* video (issue #3): videos open
+/// muted, but whatever the user picks — mute button, `M`, or dragging the
+/// volume slider to zero — becomes the new default. Writes only on an
+/// actual change, so dragging the slider does not rewrite
+/// `settings.conf` on every tick (best effort, like the other prefs).
+fn remember_mute(state: &Rc<RefCell<AppState>>, muted: bool) {
+    let changed = {
+        let mut s = state.borrow_mut();
+        if s.video_muted == muted {
+            false
+        } else {
+            s.video_muted = muted;
+            true
+        }
+    };
+    if changed {
+        debug_log!(format!(
+            "video-muted remembered: {muted} ({})",
+            if muted { "muted" } else { "audio on" }
+        ));
+        state::save_video_muted(muted);
+    }
 }
 
 /// Safety net for the `seeking` flag: it is only ever cleared by the
@@ -3046,6 +3079,11 @@ impl SlideCtxWeak {
 /// Incoming video for a slide: its own muted pipeline + wrapper, traveling
 /// once prepared with a known intrinsic size (then pre-scaled like the
 /// main path). Weak refs only, so abandoning never leaks a pipeline.
+///
+/// Always muted, even when the user unmuted (issue #3): this pipeline
+/// only travels and is dropped at commit, while the *outgoing* video is
+/// still audible — unmuting it too would play both at once. The new main
+/// pipeline built by `show_video` carries the remembered mute state.
 fn preload_slide_video(ctx: &SlideCtx, path: &Path) {
     let media = gtk::MediaFile::for_filename(path);
     media.set_loop(true);
@@ -3675,6 +3713,9 @@ fn drag_lock(state: &Rc<RefCell<AppState>>) {
 
 /// Incoming video for a drag: its own muted pipeline, marked ready (and
 /// repositioned at the live finger offset) once sized. Weak refs only.
+/// Muted for the same reason as the slide preview above (issue #3): it
+/// travels while the outgoing video may still be audible, and the
+/// committed main pipeline applies the remembered mute state itself.
 fn drag_lock_video(state: &Rc<RefCell<AppState>>, path: &Path, vw: f64, vh: f64, new_index: usize) {
     let media = gtk::MediaFile::for_filename(path);
     media.set_loop(true);
@@ -4985,9 +5026,11 @@ fn show_video(
         btn.set_icon_name("media-playback-pause-symbolic");
         btn.set_tooltip_text(Some("Pause"));
     }
-    // Reset mute button and volume scale
+    // Reset mute button and volume scale: the next video opens with the
+    // remembered choice (muted unless the user unmuted before — issue #3).
+    let remembered_muted = s.video_muted;
     if let Some(ref btn) = s.mute_btn {
-        update_mute_button(btn, true);
+        update_mute_button(btn, remembered_muted);
     }
     let volume_scale = s.volume_scale.clone();
     drop(s);
@@ -5011,7 +5054,13 @@ fn show_video(
 
     let media = gtk::MediaFile::for_filename(path);
     media.set_loop(true);
-    media.set_muted(true);
+    // Issue #3: a fresh video starts muted, unless the user unmuted a
+    // previous one and we remembered that choice.
+    debug_log!(format!(
+        "show_video: muted={remembered_muted} ({})",
+        path.display()
+    ));
+    media.set_muted(remembered_muted);
     media.set_volume(1.0);
 
     state.borrow_mut().media_file = Some(media.clone());

@@ -10,7 +10,7 @@ Fast, minimalist image and video viewer for Linux, written in Rust with GTK4/lib
 - Decodes on worker threads, prefetches neighbors, applies EXIF orientation, fits to window with aspect ratio kept
 - Zooms with keyboard, pinch, or double-click; double-click anchors at the pointer, drag pans while zoomed
 - Rotates left/right and mirrors in place from header buttons; JPEG re-encoded at q95 with EXIF normalized, no undo; animated GIF/WebP and video are view-only
-- Plays video muted, autoplaying, looped, with play/pause, seek, volume, mute, elapsed and total time
+- Plays video muted, autoplaying, looped, with play/pause, seek, volume, mute, elapsed and total time; unmuting is remembered for the next videos
 - Deletes with `Delete`: Trash first, direct delete where Trash is unsupported (remote mounts, portal paths)
 - Auto-hides header and video controls, supports fullscreen.
 
@@ -170,7 +170,7 @@ Header buttons rotate left/right and mirror. Each edit overwrites the original a
 
 ## Preferences
 
-In the app menu. Slide animation defaults on (falls back to an instant cut if the frame is not prefetched); two-finger swipe defaults off (replaces three-finger nav when on). Stored in `settings.conf` under `~/.config/carosello`.
+In the app menu. Slide animation defaults on (falls back to an instant cut if the frame is not prefetched); two-finger swipe defaults off (replaces three-finger nav when on). Videos also start muted, and the mute choice you make with `M`, the mute button or the volume slider is remembered for the next videos (`video-muted`). Stored in `settings.conf` under `~/.config/carosello`.
 
 ## File association
 

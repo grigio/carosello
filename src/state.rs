@@ -109,27 +109,50 @@ fn parse_two_finger_swipe(text: &str) -> bool {
     false
 }
 
-/// Parse both prefs from one read of the settings text: slide animation
-/// (default on) and two-finger swipe (default off).
-fn parse_prefs(text: &str) -> (bool, bool) {
-    (parse_slide_enabled(text), parse_two_finger_swipe(text))
+/// Parse the video-muted pref from settings text (default: muted — a new
+/// video starts silent, issue #3). Only an explicit `false` (the user
+/// unmuted once and we remembered it) starts videos with audio; unknown
+/// values stay muted.
+fn parse_video_muted(text: &str) -> bool {
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            if k.trim() == "video-muted" {
+                return !v.trim().eq_ignore_ascii_case("false");
+            }
+        }
+    }
+    true
 }
 
-/// Read both prefs with a single `read_to_string` — startup used to read
-/// `settings.conf` twice, once per pref (IMPROVEMENTS #8). Unreadable
-/// file yields the defaults: slide on, two-finger off.
-pub fn load_prefs_from(dir: &Path) -> (bool, bool) {
+/// Parse all prefs from one read of the settings text: slide animation
+/// (default on), two-finger swipe (default off), video muted (default on).
+fn parse_prefs(text: &str) -> (bool, bool, bool) {
+    (
+        parse_slide_enabled(text),
+        parse_two_finger_swipe(text),
+        parse_video_muted(text),
+    )
+}
+
+/// Read every pref with a single `read_to_string` — startup used to read
+/// `settings.conf` once per pref (IMPROVEMENTS #8). Unreadable file
+/// yields the defaults: slide on, two-finger off, video muted.
+pub fn load_prefs_from(dir: &Path) -> (bool, bool, bool) {
     match std::fs::read_to_string(dir.join("settings.conf")) {
         Ok(text) => parse_prefs(&text),
-        Err(_) => (true, false),
+        Err(_) => (true, false, true),
     }
 }
 
-pub fn load_prefs() -> (bool, bool) {
+pub fn load_prefs() -> (bool, bool, bool) {
     load_prefs_from(&config_dir())
 }
 
-// Single-pref readers for the settings tests (the app reads both prefs at
+// Single-pref readers for the settings tests (the app reads all prefs at
 // once via `load_prefs` — keeping them out of the binary avoids dead code).
 #[cfg(test)]
 /// Whether the slide animation is enabled (default true when unset or
@@ -143,6 +166,13 @@ pub fn load_slide_enabled_from(dir: &Path) -> bool {
 /// (default false when unset or unreadable).
 pub fn load_two_finger_swipe_from(dir: &Path) -> bool {
     load_prefs_from(dir).1
+}
+
+#[cfg(test)]
+/// Whether videos start muted (default true when unset or unreadable;
+/// false once the user has unmuted and we remembered it).
+pub fn load_video_muted_from(dir: &Path) -> bool {
+    load_prefs_from(dir).2
 }
 
 /// Update a single `key = bool` line, preserving all other lines.
@@ -194,6 +224,17 @@ pub fn save_two_finger_swipe_to(dir: &Path, enabled: bool) {
 
 pub fn save_two_finger_swipe(enabled: bool) {
     save_two_finger_swipe_to(&config_dir(), enabled);
+}
+
+/// Persist the video-muted pref (best effort, preserves other keys):
+/// whatever the user picked for this video is what the next one opens
+/// with (issue #3).
+pub fn save_video_muted_to(dir: &Path, muted: bool) {
+    update_setting_to(dir, "video-muted", muted);
+}
+
+pub fn save_video_muted(muted: bool) {
+    save_video_muted_to(&config_dir(), muted);
 }
 
 pub fn clamp_zoom(z: f64) -> f64 {
@@ -550,22 +591,54 @@ mod tests {
     }
 
     #[test]
-    fn test_load_prefs_reads_both_at_once() {
+    fn test_load_prefs_reads_all_at_once() {
         let dir = std::env::temp_dir().join(format!("carosello-prefs-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        // Missing file → defaults: slide on, two-finger off.
-        assert_eq!(load_prefs_from(&dir), (true, false));
+        // Missing file → defaults: slide on, two-finger off, video muted.
+        assert_eq!(load_prefs_from(&dir), (true, false, true));
         save_slide_enabled_to(&dir, false);
         save_two_finger_swipe_to(&dir, true);
-        assert_eq!(load_prefs_from(&dir), (false, true));
-        // The *_from delegates must report exactly the same pair.
+        save_video_muted_to(&dir, false);
+        assert_eq!(load_prefs_from(&dir), (false, true, false));
+        // The *_from delegates must report exactly the same triple.
         assert_eq!(
             (
                 load_slide_enabled_from(&dir),
-                load_two_finger_swipe_from(&dir)
+                load_two_finger_swipe_from(&dir),
+                load_video_muted_from(&dir)
             ),
             load_prefs_from(&dir)
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_video_muted_defaults_on() {
+        let dir = std::env::temp_dir().join("carosello-video-muted-missing-xyz");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(load_video_muted_from(&dir));
+        assert!(parse_video_muted(""));
+        assert!(parse_video_muted("# comment\n"));
+        assert!(parse_video_muted("video-muted = maybe\n"));
+        // Unmuted only on an explicit false (the remembered unmute).
+        assert!(!parse_video_muted("video-muted = false\n"));
+        assert!(!parse_video_muted("video-muted=FALSE\n"));
+        assert!(parse_video_muted("video-muted = true\n"));
+    }
+
+    #[test]
+    fn test_video_muted_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("carosello-vmute-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        save_video_muted_to(&dir, false);
+        assert!(!load_video_muted_from(&dir));
+        save_video_muted_to(&dir, true);
+        assert!(load_video_muted_from(&dir));
+        // Remembering the mute choice must not clobber the other prefs.
+        save_slide_enabled_to(&dir, false);
+        save_video_muted_to(&dir, false);
+        assert!(!load_slide_enabled_from(&dir));
+        assert!(!load_video_muted_from(&dir));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
