@@ -47,6 +47,11 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="1.4.0" date="2026-09-29">
+      <description>
+        <p>The video seek bar now scrubs smoothly: dragging it no longer floods the player with seek requests (issue #2), the handle stays under the pointer instead of snapping back, and playback keeps running after a long drag. Your mute choice is now remembered for every later video (issue #3), and the video controls have a clearer, Adwaita-aligned look.</p>
+      </description>
+    </release>
     <release version="1.3.1" date="2026-09-28">
       <description>
         <p>The initial window opens half a screen wide with the item's own aspect ratio, and AUR packaging is gone: the Arch package is now built and installed locally with makepkg and pacman.</p>
