@@ -101,6 +101,18 @@
   otherwise a broken nixpkgs bump sits there looking green. The PR is then
   squash-merged automatically (`gh pr merge --auto`; the repo flag
   `allow_auto_merge` is on — closing a PR cancels its auto-merge).
+- The GITHUB_TOKEN PR also needs the **repo setting** "Allow GitHub
+  Actions to create and approve pull requests" ON: GitHub began
+  enforcing it for PR *creation* in Oct 2025 and the weekly run failed
+  at "Open pull request" with "GitHub Actions is not permitted to
+  create or approve pull requests" (run 38245971293) even though the
+  workflow already granted `pull-requests: write`. Flip it via API:
+  `gh api -X PUT repos/grigio/carosello/actions/permissions/workflow
+  -f default_workflow_permissions=read -F
+  can_approve_pull_request_reviews=true`. Verified by dispatching the
+  workflow: PR #5 opened and merged in ~4 min, first PR since Oct 12
+  (the gap closed by re-running on current master). The workflow file
+  itself needed no change.
 - Vendoring = `rustPlatform.importCargoLock` + `rustPlatform.cargoSetupHook`.
   The hook writes `.cargo/config.toml` at the build root (`/build`), which
   cargo finds by walking up from meson's `build/` dir, so the
