@@ -71,6 +71,13 @@
   after installing; never `git add -A` right after a package build.
   `makepkg -si` also stops at pacman's `[Y/n]` prompt in a non-TTY shell —
   pass `--noconfirm` (or `pacman -U --noconfirm carosello-*.pkg.tar.zst`).
+- `Swatinem/rust-cache@v2` caches registry+target in the CI build job
+  (invalidates on `Cargo.lock`; `cache-all-targets` covers clippy's and
+  the tests' test crates). `.github/workflows/deny.yml` runs
+  `cargo deny check advisories` (config `deny.toml`, advisories only) on
+  lockfile-touching PRs plus a weekly cron: a known CVE in `image` —
+  the whole decode surface for untrusted bytes — turns CI red instead
+  of lingering.
 - **Runtime bump = 2 places**: `runtime-version: 'NN'` in the manifest and
   the CI image `ghcr.io/flathub-infra/flatpak-github-actions:gnome-NN`
   (same NN; `gnome-49/50/51` all exist on ghcr). Then
@@ -418,3 +425,22 @@
   (`fullscreen-exit: key Escape`, `trash failed for …`) instead — a
   launched window does take keyboard focus, so `wtype -k F11/Escape/
   Delete` reaches it without a click.
+- **Headless captures (Xvfb)**: `Xvfb :99 -screen 0 1560x1040x24` + launch
+  with **`GDK_BACKEND=x11 DISPLAY=:99`** — without `GDK_BACKEND` GTK
+  silently paints on the *live* Wayland session (`$WAYLAND_DISPLAY`
+  outranks the X display every time) and Xvfb stays black. No window
+  manager ⇒ the window maps at (0,0) at its fit size (780×780 for a 1:1
+  first item), and the auto-hide panels start `.faded` with **no source
+  of motion on a virtual display**, so the header never reveals on its
+  own: synthesize one — `xdotool mousemove 200 22` + a 1 px
+  `mousemove_relative` (Guarantee an event), wait ≥350 ms for the CSS
+  opacity transition, then `magick import -window root` (no cursor, no
+  dock, deterministic geometry). Control check when chrome suspects a
+  bug: `loupe` renders its full header in the same rig — missing chrome
+  there would be an app bug, and here it wasn't one. Verify a capture
+  against `CAROSELLO_DEBUG=1` (`CAROSELLO_TRACE_POINTER=1` alone emits
+  nothing: every line is gated by `debug_enabled()`, so set both).
+- AppStream screenshot rules that bit (metainfo `<screenshot>`):
+  `appstream-util validate` wants **≥624×351** and `<caption>` ≤ 50
+  chars; it fetches the GitHub-raw URL, so validation passes only once
+  the image is pushed to the branch it links.

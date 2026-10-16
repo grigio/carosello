@@ -1311,12 +1311,13 @@ pub fn build(app: &adw::Application, start: Option<&Path>) -> adw::ApplicationWi
             let filters = gio::ListStore::new::<gtk::FileFilter>();
             let img_filter = gtk::FileFilter::new();
             img_filter.set_name(Some("Images and Videos"));
-            for pat in [
-                "*.jpg", "*.jpeg", "*.png", "*.webp", "*.gif", "*.bmp", "*.tiff", "*.tif", "*.mp4",
-                "*.webm", "*.mkv",
-            ] {
-                img_filter.add_pattern(pat);
-                img_filter.add_pattern(&pat.to_ascii_uppercase());
+            // Patterns derived from the state.rs extension lists, both
+            // cases: the picker never drifts from what the viewer
+            // actually accepts (the literal list used to omit any newly
+            // supported extension, .mov/.m4v/.avi included).
+            for ext in state::IMAGE_EXTS.iter().chain(state::VIDEO_EXTS.iter()) {
+                img_filter.add_pattern(&format!("*.{ext}"));
+                img_filter.add_pattern(&format!("*.{}", ext.to_ascii_uppercase()));
             }
             filters.append(&img_filter);
             let all_filter = gtk::FileFilter::new();
@@ -4126,11 +4127,11 @@ fn trash_current(
         }
         s.files[s.index].clone()
     };
+    // Lossy, not `to_str()`: a non-UTF-8 name shows as its best-effort
+    // form in the toast instead of falling back to "file".
     let name = path
         .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("file")
-        .to_string();
+        .map_or_else(|| "file".to_owned(), |n| n.to_string_lossy().into_owned());
 
     // GIO trash (goes to Trash, not permanent delete), async so a
     // network/portal path can't freeze the UI (report #8). Needs write
@@ -4332,9 +4333,8 @@ fn run_transform(
                     .map_err(|e| format!("Cannot read {}: {e}", worker_path.display()))?;
                 let ext = worker_path
                     .extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or_default();
-                let out = transform::transform_bytes(&bytes, ext, op)?;
+                    .map_or_else(String::new, |e| e.to_string_lossy().into_owned());
+                let out = transform::transform_bytes(&bytes, &ext, op)?;
                 Ok((out, mode))
             })();
             if let Ok(mut guard) = slot.lock() {
@@ -4398,9 +4398,7 @@ fn finish_transform(
 
     let name = path
         .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("file")
-        .to_string();
+        .map_or_else(|| "file".to_owned(), |n| n.to_string_lossy().into_owned());
     let file = gio::File::for_path(path);
     let state_c = state.clone();
     let picture_c = picture.clone();
@@ -4609,11 +4607,11 @@ fn show_file(
     }
     scrolled.set_visible(true);
 
+    // Lossy rather than `to_str()` — a non-UTF-8 name still titles the
+    // window (rendered best-effort) instead of leaving it blank.
     let name = path
         .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("")
-        .to_string();
+        .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
     // HIG: WindowTitle shows filename + counter as subtitle, WM title is just filename
     window.set_title(Some(&name));
     if let Some(ref wt) = state.borrow().window_title.clone() {

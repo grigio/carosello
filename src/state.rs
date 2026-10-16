@@ -1,7 +1,14 @@
 use std::path::{Path, PathBuf};
 
 pub const IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "png", "webp", "gif", "bmp", "tiff", "tif"];
-pub const VIDEO_EXTS: &[&str] = &["mp4", "webm", "mkv"];
+/// Containers handed to the player (`GtkMediaFile` → playbin), which
+/// plays whatever the *installed* GStreamer plugins demux. `.mov`/`.m4v`
+/// (iPhone/QuickTime) and `.avi` ride on `qtdemux`/`avisdemux` — both in
+/// gst-plugins-good, part of the README-recommended plugin set — so they
+/// only needed to stop being filtered by extension. No `.ts` family on
+/// purpose: TypeScript source files share that extension and an opened
+/// code folder would flood the viewer with "videos".
+pub const VIDEO_EXTS: &[&str] = &["mp4", "webm", "mkv", "mov", "m4v", "avi"];
 pub const ZOOM_MAX: f64 = 20.0;
 pub const ZOOM_MIN: f64 = 0.1;
 pub const MAX_DIM: f64 = 8192.0;
@@ -38,25 +45,31 @@ macro_rules! debug_log {
 }
 pub(crate) use debug_log;
 
-/// Case-insensitive extension test without allocating: compares the
-/// original extension against each candidate (was `to_ascii_lowercase()`
-/// per check — IMPROVEMENTS, micro).
+/// Case-insensitive extension test without allocating, comparing the
+/// extension's raw path bytes: a non-UTF-8 filename (Latin-1 camera
+/// dumps) keeps working through its ASCII extension, where `to_str()`
+/// used to yield `None` and make the file invisible. `OsStr::
+/// as_encoded_bytes` is a lossless, self-consistent encoding (was the
+/// `to_ascii_lowercase()`-per-candidate allocation — IMPROVEMENTS).
 pub fn has_ext(path: &Path, exts: &[&str]) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .map(|e| exts.iter().any(|x| e.eq_ignore_ascii_case(x)))
-        .unwrap_or(false)
+    let Some(ext) = path.extension() else {
+        return false;
+    };
+    let bytes = ext.as_encoded_bytes();
+    exts.iter()
+        .any(|x| x.as_bytes().eq_ignore_ascii_case(bytes))
 }
 
 pub fn is_media(path: &Path) -> bool {
     // One `path.extension()` for both lists (it used to run twice).
-    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+    let Some(ext) = path.extension() else {
         return false;
     };
+    let bytes = ext.as_encoded_bytes();
     IMAGE_EXTS
         .iter()
         .chain(VIDEO_EXTS.iter())
-        .any(|x| ext.eq_ignore_ascii_case(x))
+        .any(|x| x.as_bytes().eq_ignore_ascii_case(bytes))
 }
 
 /// Config dir for user preferences (`$XDG_CONFIG_HOME/carosello`,
@@ -355,10 +368,16 @@ impl NatPart {
 
 /// Sort media paths naturally by filename (`IMG2` before `IMG10`).
 /// `sort_by_cached_key` builds each key once (n) instead of once per
-/// comparison (n log n × 2 key builds — IMPROVEMENTS #5).
+/// comparison (n log n × 2 key builds — IMPROVEMENTS #5). The key is
+/// built from a `to_string_lossy` copy so non-UTF-8 names sort in their
+/// best-effort form instead of all collapsing onto the empty string
+/// (`to_str()` used to yield `None` there).
 pub fn sort_media_paths(files: &mut [PathBuf]) {
     files.sort_by_cached_key(|p| {
-        natural_key(p.file_name().and_then(|n| n.to_str()).unwrap_or_default())
+        let name = p
+            .file_name()
+            .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        natural_key(&name)
     });
 }
 
@@ -451,7 +470,39 @@ mod tests {
     fn test_has_ext_no_match() {
         assert!(!has_ext(&PathBuf::from("document.pdf"), IMAGE_EXTS));
         assert!(!has_ext(&PathBuf::from("archive.zip"), VIDEO_EXTS));
+        // Deliberate gap (see VIDEO_EXTS): TypeScript owns `.ts`.
+        assert!(!has_ext(&PathBuf::from("script.ts"), VIDEO_EXTS));
         assert!(!has_ext(&PathBuf::from("noext"), IMAGE_EXTS));
+    }
+
+    /// Non-UTF-8 filenames (Latin-1 camera dumps, e.g. Finder-exported
+    /// `caf\xE9.jpg`) used to vanish: `has_ext` went through `to_str()`,
+    /// which yields `None` for invalid UTF-8 and failed the file. The
+    /// byte-based match must qualify them through the ASCII extension.
+    #[cfg(unix)]
+    #[test]
+    fn test_non_utf8_names_match_media_extensions() {
+        use std::os::unix::ffi::OsStringExt;
+        let latin1 = |b: &[u8]| PathBuf::from(std::ffi::OsString::from_vec(b.to_vec()));
+
+        let jpg = latin1(b"caf\xE9.jpg");
+        assert!(has_ext(&jpg, IMAGE_EXTS), "invalid stem, valid ext");
+        assert!(is_media(&jpg));
+        // Case-insensitivity still applies to the bytes.
+        assert!(has_ext(&latin1(b"VID_0001\xE9.MOV"), VIDEO_EXTS));
+        // Unsupported extension stays out even on an invalid name.
+        assert!(!has_ext(&latin1(b"caf\xE9.zip"), IMAGE_EXTS));
+        // A non-ASCII byte *inside* the extension never matches.
+        assert!(!has_ext(&latin1(b"photo.jpg\xE9"), IMAGE_EXTS));
+
+        // Natural sort: the lossy key keeps `\xE9` names next to their
+        // ASCII siblings instead of collapsing onto "" (all-or-nothing).
+        let mut files = vec![latin1(b"IMG_0002\xE9.jpg"), latin1(b"IMG_0001.jpg")];
+        sort_media_paths(&mut files);
+        assert_eq!(
+            files,
+            vec![latin1(b"IMG_0001.jpg"), latin1(b"IMG_0002\xE9.jpg")]
+        );
     }
 
     #[test]
@@ -459,6 +510,14 @@ mod tests {
         assert!(is_media(&PathBuf::from("photo.jpg")));
         assert!(is_media(&PathBuf::from("video.mp4")));
         assert!(is_media(&PathBuf::from("image.webp")));
+        // Shared demuxers behind GtkMediaFile: QuickTime (.mov, .m4v) and
+        // AVI ride on the same GStreamer plugin set the README installs.
+        assert!(is_media(&PathBuf::from("iphone_clip.MOV")));
+        assert!(is_media(&PathBuf::from("episode.m4v")));
+        assert!(is_media(&PathBuf::from("tape.avi")));
+        // The TypeScript shared extension stays out (deliberate, see the
+        // VIDEO_EXTS comment; `.ts` risk documented there).
+        assert!(!is_media(&PathBuf::from("script.ts")));
         assert!(!is_media(&PathBuf::from("document.pdf")));
     }
 
@@ -501,15 +560,19 @@ mod tests {
     /// (IMPROVEMENTS §1.5): only *regular* files with a media extension
     /// get a viewer slot. A dangling symlink named `*.jpg` must not — its
     /// extension lies and `is_file()` says no — while a symlink *to* a
-    /// real image does, because stat follows the link.
+    /// real image does, because stat follows the link. A non-UTF-8 name
+    /// with a valid extension belongs to the list too.
     #[test]
     fn test_collect_media_skips_non_regular_and_non_media() {
+        use std::os::unix::ffi::OsStringExt;
         let dir = std::env::temp_dir().join(format!("carosello-collect-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
         std::fs::write(dir.join("real.jpg"), b"jpeg").unwrap();
         std::fs::write(dir.join("notes.txt"), b"text").unwrap();
+        let latin1_name = std::ffi::OsString::from_vec(b"caf\xE9.jpg".to_vec());
+        std::fs::write(dir.join(&latin1_name), b"jpeg").unwrap();
         std::os::unix::fs::symlink(dir.join("missing-target"), dir.join("dangling.jpg")).unwrap();
         std::os::unix::fs::symlink(dir.join("real.jpg"), dir.join("link.jpg")).unwrap();
 
@@ -517,8 +580,12 @@ mod tests {
         got.sort();
         assert_eq!(
             got,
-            vec![dir.join("link.jpg"), dir.join("real.jpg")],
-            "regular media files only (dangling symlink excluded)"
+            vec![
+                dir.join(&latin1_name),
+                dir.join("link.jpg"),
+                dir.join("real.jpg")
+            ],
+            "regular media files only (dangling symlink excluded, non-UTF-8 included)"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

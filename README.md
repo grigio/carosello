@@ -19,7 +19,7 @@ Fast, minimalist image and video viewer for Linux, written in Rust with GTK4/lib
 | Type | Formats |
 |------|---------|
 | Images | JPEG (`.jpg`, `.jpeg`), PNG, WebP, GIF, BMP, TIFF (`.tif`, `.tiff`) |
-| Video | MP4, WebM, Matroska (`.mkv`) |
+| Video | MP4, WebM, Matroska (`.mkv`), QuickTime (`.mov`, `.m4v`), AVI (`.avi`) |
 
 Extensions match case-insensitively. Image decoding reads file contents; video codecs come from installed GStreamer plugins.
 
@@ -174,7 +174,7 @@ In the app menu. Slide animation defaults on (falls back to an instant cut if th
 
 ## File association
 
-The desktop entry registers JPEG, PNG, WebP, GIF, BMP, TIFF, MP4, WebM, and Matroska types, mirrored in AppStream `<provides>` plus legacy BMP/TIFF aliases.
+The desktop entry registers JPEG, PNG, WebP, GIF, BMP, TIFF, MP4, WebM, Matroska, QuickTime (`.mov`, `.m4v`), and AVI types, mirrored in AppStream `<provides>` plus legacy BMP/TIFF aliases.
 
 To make it the default for all supported types:
 
@@ -182,7 +182,8 @@ To make it the default for all supported types:
 xdg-mime default io.github.grigio.carosello.desktop \
   image/jpeg image/png image/webp image/gif image/bmp \
   image/x-bmp image/x-ms-bmp image/tiff image/x-tiff \
-  video/mp4 video/webm video/x-matroska
+  video/mp4 video/webm video/x-matroska \
+  video/quicktime video/x-m4v video/x-msvideo
 ```
 
 Or set one type through GIO:

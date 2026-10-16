@@ -61,6 +61,14 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      # Registry + target/ cache, invalidating on Cargo.lock. clippy
+      # --all-targets and cargo test compile test targets too, so cache
+      # them (a cold job otherwise re-fetches every crate).
+      - name: Cache cargo dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-all-targets: true
+
       - name: Check formatting
         run: cargo fmt --check
 

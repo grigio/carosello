@@ -33,6 +33,9 @@
     <mediatype>video/mp4</mediatype>
     <mediatype>video/webm</mediatype>
     <mediatype>video/x-matroska</mediatype>
+    <mediatype>video/quicktime</mediatype>
+    <mediatype>video/x-m4v</mediatype>
+    <mediatype>video/x-msvideo</mediatype>
   </provides>
   <url type="homepage">https://github.com/grigio/carosello</url>
   <url type="bugtracker">https://github.com/grigio/carosello/issues</url>
@@ -42,8 +45,8 @@
   <content_rating type="oars-1.1" />
   <screenshots>
     <screenshot type="default">
-      <image>https://github.com/grigio/carosello/raw/master/carosello.gif</image>
-      <caption>Carosello viewing images with navigation controls</caption>
+      <image>https://github.com/grigio/carosello/raw/master/screenshot.png</image>
+      <caption>Carosello viewing an image with viewer controls</caption>
     </screenshot>
   </screenshots>
   <releases>

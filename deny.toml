@@ -1,0 +1,8 @@
+# Security advisories only: `cargo deny check advisories` is the check
+# wired into CI (.github/workflows/deny.yml). License/source/ban policies
+# are not policed here — the dependency tree is small and every Cargo.lock
+# change is reviewed in PRs; add `[licenses]`/`[sources]` sections if that
+# ever changes.
+
+[advisories]
+version = 2

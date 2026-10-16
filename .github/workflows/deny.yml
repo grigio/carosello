@@ -1,0 +1,30 @@
+name: Dependency advisories
+
+# RustSec advisory scan over Cargo.lock (config: deny.toml, advisories
+# only). Pull requests re-scan when the dependency set moves; the weekly
+# cron catches advisories landing between PRs — `image` is this app's
+# whole decode surface for untrusted bytes, so a known CVE should turn
+# CI red, not linger silently.
+
+on:
+  pull_request:
+    paths:
+      - Cargo.lock
+      - Cargo.toml
+      - deny.toml
+      - .github/workflows/deny.yml
+  schedule:
+    - cron: '0 6 * * 1'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  advisories:
+    # cargo-deny reads Cargo.lock and the advisory DB directly: no Rust
+    # toolchain, no full build.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: taiki-e/install-action@cargo-deny
+      - run: cargo deny check advisories
