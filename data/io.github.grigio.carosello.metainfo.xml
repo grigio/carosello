@@ -50,6 +50,11 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="1.4.1" date="2026-10-16">
+      <description>
+        <p>QuickTime (.mov, .m4v) and AVI videos play now, and files with non-UTF-8 names no longer vanish from a folder. The file-open picker derives its format list from the viewer's own extension lists, the AppStream metadata regained a valid screenshot with cleaned-up desktop categories, and CI got a dependency cache plus weekly RustSec advisory scanning.</p>
+      </description>
+    </release>
     <release version="1.4.0" date="2026-09-29">
       <description>
         <p>The video seek bar now scrubs smoothly: dragging it no longer floods the player with seek requests (issue #2), the handle stays under the pointer instead of snapping back, and playback keeps running after a long drag. Your mute choice is now remembered for every later video (issue #3), and the video controls have a clearer, Adwaita-aligned look.</p>
