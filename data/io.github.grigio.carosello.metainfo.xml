@@ -50,6 +50,11 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="1.4.2" date="2026-10-21">
+      <description>
+        <p>New split-view app icon, and the Flatpak build moves to the GNOME 51 runtime with GTK 4.24. Dependency patch updates, and the shipped lockfile now matches the manifest so locked builds work again.</p>
+      </description>
+    </release>
     <release version="1.4.1" date="2026-10-16">
       <description>
         <p>QuickTime (.mov, .m4v) and AVI videos play now, and files with non-UTF-8 names no longer vanish from a folder. The file-open picker derives its format list from the viewer's own extension lists, the AppStream metadata regained a valid screenshot with cleaned-up desktop categories, and CI got a dependency cache plus weekly RustSec advisory scanning.</p>
