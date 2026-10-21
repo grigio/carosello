@@ -84,8 +84,12 @@
   `flatpak install --user flathub org.gnome.Platform//NN org.gnome.Sdk//NN`.
   `sdk-extensions: rust-stable` resolves against the **freedesktop** SDK
   branch underneath GNOME, *not* GNOME's number: GNOME 50 → freedesktop
-  25.08 → `rust-stable//25.08`. There is no `rust-stable//50` — asking
-  for it fails with "Can't find ref".
+  25.08 → `rust-stable//25.08`; GNOME 51 → freedesktop 26.08 →
+  `rust-stable//26.08`. There is no `rust-stable//51` — asking for it
+  fails with "Can't find ref"; find the real branch with
+  `flatpak remote-info --user --show-metadata flathub org.gnome.Platform//NN`
+  (the `[Extension org.freedesktop.Platform.GL] versions = 26.08;…` line
+  names the base).
 
 ## Nix / flake
 
@@ -212,7 +216,7 @@
   runs as **root** (no `sudo`) and has **no toolchain** (Rust comes from
   `dtolnay/rust-toolchain@stable`, components `rustfmt, clippy`). The
   tag-only `flatpak` job (`gnome-NN` image) is independent — green on
-  gnome-50.
+  gnome-51.
 - Reinstall: `flatpak-builder --user --install --force-clean build-dir
   io.github.grigio.carosello.yml`
 - Smoke test headless, check stderr is empty (no panic, no GVFS warnings):
