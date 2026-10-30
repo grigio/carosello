@@ -55,7 +55,10 @@
   version via `build-aux/cargo-version.py`; the About dialog uses
   `env!("CARGO_PKG_VERSION")`. Never hardcode a version in `meson.build`.
 - Bump with `build-aux/bump-version.sh <ver> ["notes"]` — updates
-  `Cargo.toml`, prepends the metainfo `<release>`, sets `PKGBUILD` pkgver.
+  `Cargo.toml` **and `Cargo.lock`** (the lock records the root package
+  version; a stale one made the `archlinux` job die in `prepare()` with
+  `cannot update the lock file … because --locked was passed` on v1.4.3),
+  prepends the metainfo `<release>`, sets `PKGBUILD` pkgver.
   Flatpak needs nothing (version shown comes from
   the metainfo releases). Then tag `v<ver>` and run `updpkgsums`.
 - CI `versions` job fails on any drift between Cargo / metainfo / PKGBUILD /
@@ -65,6 +68,10 @@
   it silently keeps the *previous* hash. `rm -f carosello-*.tar.gz` first,
   then `updpkgsums`, and confirm the
   hash against `curl -sL …/archive/refs/tags/v<ver>.tar.gz | sha256sum`.
+  Retagging (`git tag -f` + `git push -f origin v<ver>`) does regenerate
+  the codeload archive — verified on v1.4.3, where the re-fetched tarball
+  contained the fixed `Cargo.lock`; still confirm by extracting it and
+  reading the root package version.
 - **makepkg's `$srcdir` is `src/`** — same dir as the Rust sources: a
   `makepkg` run leaves an untracked `src/carosello-*/` (~1.5 GB build tree)
   plus a tarball entry (both gitignored now). `rm -rf src/carosello-*`
