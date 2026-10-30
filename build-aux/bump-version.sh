@@ -4,7 +4,8 @@
 # Usage: build-aux/bump-version.sh 1.0.10 ["Release notes for the metainfo entry."]
 #
 # Updates:
-#   Cargo.toml            (source of truth; Cargo.lock refreshes on next cargo build)
+#   Cargo.toml            (source of truth)
+#   Cargo.lock            (root package version, keeps `--locked` builds green)
 #   data/*.metainfo.xml   (prepends a <release> entry dated today)
 #   PKGBUILD              (pkgver, resets pkgrel to 1)
 #
@@ -23,6 +24,15 @@ META="$ROOT/data/io.github.grigio.carosello.metainfo.xml"
 
 # 1. Cargo.toml (source of truth)
 sed -i "s/^version = \".*\"/version = \"$V\"/" "$ROOT/Cargo.toml"
+
+# 1b. Cargo.lock carries the root package version too. The archlinux CI job
+#     runs `cargo fetch --locked` on the tag tarball, which aborts with
+#     "cannot update the lock file … because --locked was passed" when the
+#     lock still says the old version. `cargo metadata` refreshes it without
+#     building; offline first so a warm cache is enough.
+if ! cargo metadata --offline --format-version 1 >/dev/null 2>&1; then
+  cargo metadata --format-version 1 >/dev/null
+fi
 
 # 2. Metainfo: prepend a <release> entry (kept in sync with Cargo by CI).
 # Line-based insertion keeps the surrounding formatting untouched.
