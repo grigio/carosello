@@ -50,6 +50,11 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="1.4.3" date="2026-10-30">
+      <description>
+        <p>Update dependencies.</p>
+      </description>
+    </release>
     <release version="1.4.2" date="2026-10-21">
       <description>
         <p>New split-view app icon, and the Flatpak build moves to the GNOME 51 runtime with GTK 4.24. Dependency patch updates, and the shipped lockfile now matches the manifest so locked builds work again.</p>
