@@ -71,6 +71,19 @@
   after installing; never `git add -A` right after a package build.
   `makepkg -si` also stops at pacman's `[Y/n]` prompt in a non-TTY shell —
   pass `--noconfirm` (or `pacman -U --noconfirm carosello-*.pkg.tar.zst`).
+- **The tag release also ships the Arch package** (`archlinux` job in
+  `ci.yml`, `archlinux:base-devel` container): same `PKGBUILD`, same
+  tarball the local `makepkg` uses. It recomputes `sha256sums` with
+  `updpkgsums` because the committed hashes can only be refreshed once
+  the tag exists; `needs: [versions]` keeps the filename's `pkgver` honest.
+  Every container step is root and **makepkg refuses root**, so the
+  PKGBUILD is copied to an unprivileged `builder` home; `git` is not in
+  `base-devel` (checkout needs it) and the keyring is refreshed before the
+  first upgrade. `carosello-debug` is dropped — only
+  `carosello-<ver>-1-x86_64.pkg.tar.zst` goes to the release, so the
+  `release` job gained it in `needs`. Reproduced with podman
+  (`--rm` container, same script): `check()` green (59 tests) and the
+  package installs its binary/desktop/metainfo/icons.
 - `Swatinem/rust-cache@v2` caches registry+target in the CI build job
   (invalidates on `Cargo.lock`; `cache-all-targets` covers clippy's and
   the tests' test crates). `.github/workflows/deny.yml` runs

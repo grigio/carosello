@@ -150,9 +150,74 @@ jobs:
           bundle: carosello.flatpak
           artifact-name: carosello-${{ github.ref_name }}-x86_64.flatpak
 
+  # Arch Linux package (.pkg.tar.zst) attached to the tag release, same
+  # PKGBUILD a local `makepkg` uses. Runs on the tag only: the upstream
+  # tarball it builds from (archive/refs/tags/v<ver>.tar.gz) exists only
+  # once the tag is pushed.
+  archlinux:
+    if: startsWith(github.ref, 'refs/tags/')
+    # `versions` proves PKGBUILD pkgver == Cargo.toml == tag before we build
+    # a package whose filename embeds that version.
+    needs: [versions]
+    runs-on: ubuntu-latest
+    container:
+      # No --privileged: makepkg runs under fakeroot, which does not need
+      # extra capabilities (verified in a plain `podman run`).
+      image: archlinux:base-devel
+    steps:
+      # Every step runs as root in a container job, and makepkg refuses to
+      # run as root, so the build is handed to an unprivileged user below.
+      # git is not part of base-devel and actions/checkout needs it; the
+      # keyring must be refreshed first or a stale image fails signature
+      # checks on the very first upgrade.
+      - name: Bootstrap container
+        run: |
+          pacman -Sy --noconfirm --needed archlinux-keyring
+          pacman -Su --noconfirm --needed
+          pacman -S --noconfirm --needed git
+
+      - uses: actions/checkout@v5
+
+      - name: Build package
+        run: |
+          # makedepends + checkdepends + runtime depends: installing them up
+          # front means makepkg never needs sudo (no `-s`/`--syncdeps`).
+          pacman -S --noconfirm --needed \
+            meson cargo gtk4 libadwaita glib2 graphene hicolor-icon-theme \
+            appstream desktop-file-utils gdk-pixbuf2 pacman-contrib
+
+          useradd -m builder
+          install -d -o builder -g builder /home/builder/pkg
+          cp PKGBUILD gpl-3.0.txt cargo-lock.patch /home/builder/pkg/
+          chown -R builder:builder /home/builder/pkg
+
+          # The committed sha256sums can only be recomputed once the tag
+          # tarball exists (that is what `updpkgsums` does after a manual
+          # release), so derive them from the real archive here.
+          su builder -c 'set -e
+            cd ~/pkg
+            updpkgsums
+            makepkg --noconfirm'
+
+          install -d out
+          # makepkg also emits a carosello-debug companion package; publish
+          # only the runtime one.
+          for pkg in /home/builder/pkg/carosello-*.pkg.tar.zst; do
+            case "$pkg" in *-debug-*) continue ;; esac
+            cp "$pkg" out/
+          done
+          ls -l out
+
+      - name: Upload package
+        uses: actions/upload-artifact@v7
+        with:
+          name: carosello-${{ github.ref_name }}-archlinux-x86_64
+          path: out/*.pkg.tar.zst
+          if-no-files-found: error
+
   release:
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [build, flatpak]
+    needs: [build, flatpak, archlinux]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -201,6 +266,7 @@ jobs:
           files: |
             artifacts/carosello-linux-x86_64/carosello
             artifacts/carosello-${{ github.ref_name }}-x86_64.flatpak/carosello.flatpak
+            artifacts/carosello-${{ github.ref_name }}-archlinux-x86_64/*.pkg.tar.zst
 
       # Run after the release exists; a separate `on: release` workflow would
       # not be triggered by the GITHUB_TOKEN-created release above.

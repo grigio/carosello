@@ -96,6 +96,12 @@ sudo pacman -U carosello-*.pkg.tar.zst
 
 `PKGBUILD` downloads the release tarball named by `pkgver` from the GitHub tag, so `makepkg` builds the **tagged source, not your working tree** — for local changes use the Meson or Cargo build above. A run also leaves `src/carosello-*/` and `src/*.tar.gz` behind (gitignored): `rm -rf src/carosello-*` when done, and never `git add -A` right after a package build.
 
+Each tagged release also attaches a prebuilt `carosello-<ver>-1-x86_64.pkg.tar.zst` (CI builds it from the same `PKGBUILD`), so you can skip the local build:
+
+```bash
+sudo pacman -U carosello-*-x86_64.pkg.tar.zst
+```
+
 ### Flatpak artifact
 
 Download the latest `.flatpak` file from
